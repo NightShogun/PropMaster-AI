@@ -20,14 +20,18 @@ except ImportError as exc:
     raise SystemExit("Install Pillow first: pip install pillow") from exc
 
 
-DEFAULT_VIDEO_WIDTH = 450
-DEFAULT_VIDEO_HEIGHT = 250
+DEFAULT_VIDEO_WIDTH = 600
+DEFAULT_VIDEO_HEIGHT = 338
 VIDEO_ASPECT_RATIO = DEFAULT_VIDEO_HEIGHT / DEFAULT_VIDEO_WIDTH
-MIN_VIDEO_WIDTH = 260
-MAX_VIDEO_WIDTH = 680
+MIN_VIDEO_WIDTH = 360
+MAX_VIDEO_WIDTH = 760
 VIDEO_FPS = 24
-COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
-COMMONS_VIDEO_SEARCH_LIMIT = 32
+ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php"
+ARCHIVE_METADATA_URL = "https://archive.org/metadata"
+ARCHIVE_VIDEO_SEARCH_LIMIT = 12
+ARCHIVE_ITEMS_PER_QUERY = 4
+ARCHIVE_VIDEO_EXTENSIONS = (".mp4", ".m4v", ".webm", ".ogv", ".mov")
+ARCHIVE_VIDEO_FORMAT_TERMS = ("mpeg4", "h.264", "webm", "matroska", "ogv", "quicktime", "movie")
 MAX_EXACT_VIDEO_QUERY_ATTEMPTS = 6
 MAX_BROAD_VIDEO_QUERY_ATTEMPTS = 12
 MAX_LLAMA_VIDEO_QUERY_ATTEMPTS = 8
@@ -40,6 +44,19 @@ LLAMA_TIMEOUT_SECONDS = 8
 HTTP_HEADERS = {
     "User-Agent": "MarinePropellerAdvisor/1.0 (educational tkinter app)",
 }
+
+APP_BG = "#eef4f8"
+SURFACE = "#ffffff"
+SURFACE_SOFT = "#f8fafc"
+VIDEO_SURFACE = "#0f172a"
+BORDER = "#d8e0e8"
+TEXT = "#111827"
+MUTED_TEXT = "#5f6b7a"
+ACCENT = "#0f766e"
+ACCENT_DARK = "#115e59"
+SECONDARY = "#2563eb"
+SECONDARY_DARK = "#1d4ed8"
+DANGER = "#b42318"
 
 SHIP_TYPES = (
     "cargo",
@@ -188,11 +205,18 @@ def video_title(title):
     return cleaned_title or t("Online propeller video", "فيديو رفاس من الإنترنت")
 
 
-def commons_page_url(title):
-    if not title:
+def archive_details_url(identifier):
+    if not identifier:
         return ""
 
-    return "https://commons.wikimedia.org/wiki/" + quote(title.replace(" ", "_"), safe=":/")
+    return "https://archive.org/details/" + quote(identifier, safe="")
+
+
+def archive_download_url(identifier, file_name):
+    if not identifier or not file_name:
+        return ""
+
+    return f"https://archive.org/download/{quote(identifier, safe='')}/{quote(file_name, safe='/')}"
 
 
 def estimate_spec_text(estimate):
@@ -213,9 +237,16 @@ def number_tokens(value):
 
 
 def score_video_candidate(candidate, estimate, recommendation):
-    title = candidate.get("title", "")
-    video_url = candidate.get("url", "")
-    raw_text = f"{title} {video_url}".lower()
+    searchable_fields = [
+        candidate.get("title", ""),
+        candidate.get("description", ""),
+        candidate.get("subject", ""),
+        candidate.get("identifier", ""),
+        candidate.get("file_name", ""),
+        candidate.get("query", ""),
+        candidate.get("url", ""),
+    ]
+    raw_text = " ".join(str(field) for field in searchable_fields).lower()
     searchable_text = normalized_search_text(raw_text)
     score = 0
     blade_count = estimate["blades"]
@@ -228,6 +259,12 @@ def score_video_candidate(candidate, estimate, recommendation):
 
     if "ship" in searchable_text or "marine" in searchable_text or "vessel" in searchable_text:
         score += 35
+
+    if "boat" in searchable_text or "drydock" in searchable_text or "underwater" in searchable_text:
+        score += 18
+
+    if "rudder" in searchable_text or "propulsion" in searchable_text or "cavitation" in searchable_text:
+        score += 15
 
     if "video" in searchable_text:
         score += 10
@@ -260,6 +297,9 @@ def score_video_candidate(candidate, estimate, recommendation):
 
     if "fahrgeschaft" in searchable_text or "ride" in searchable_text or "amusement" in searchable_text:
         score -= 60
+
+    if "toy" in searchable_text or "lego" in searchable_text or "game" in searchable_text:
+        score -= 45
 
     return score
 
@@ -342,7 +382,7 @@ def propeller_context(ship_type, speed_knots, estimate, recommendation):
 
 def build_llama_video_queries(ship_type, speed_knots, estimate, recommendation):
     prompt = f"""
-You generate Wikimedia Commons media-search queries for marine propeller videos.
+You generate public video archive search queries for marine propeller videos.
 Use the estimated propeller specs, but avoid impossible over-specific queries.
 Do not return URLs. Do not invent file names.
 Return only JSON with this shape:
@@ -353,9 +393,10 @@ Propeller context:
 
 Rules:
 - Prefer marine, ship, vessel, boat, screw propeller, drydock, underwater, cavitation, nozzle, controllable pitch terms when relevant.
+- Write queries that can find Internet Archive video records.
 - Include blade count in some queries and omit it in some queries.
 - Include the word video in most queries.
-- Return 5 to 8 short English queries.
+- Return 5 to 8 short English queries.1
 """
     response = call_llama_json(prompt)
     if not isinstance(response, dict):
@@ -638,55 +679,154 @@ def build_video_queries(ship_type, speed_knots, estimate, recommendation):
     }
 
 
-def search_commons_videos(query, estimate, recommendation, require_blade_match):
+def clean_metadata_text(value):
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(clean_metadata_text(item) for item in value)
+
+    if isinstance(value, dict):
+        return " ".join(clean_metadata_text(item) for item in value.values())
+
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return " ".join(text.split())
+
+
+def archive_file_is_video(file_info):
+    name = file_info.get("name", "").lower()
+    file_format = file_info.get("format", "").lower()
+    return name.endswith(ARCHIVE_VIDEO_EXTENSIONS) or any(
+        term in file_format for term in ARCHIVE_VIDEO_FORMAT_TERMS
+    )
+
+
+def archive_file_mime(file_name):
+    name = file_name.lower()
+    if name.endswith((".mp4", ".m4v", ".mov")):
+        return "video/mp4"
+    if name.endswith(".webm"):
+        return "video/webm"
+    if name.endswith(".ogv"):
+        return "video/ogg"
+
+    return "video/*"
+
+
+def archive_video_file_score(file_info):
+    name = file_info.get("name", "").lower()
+    file_format = file_info.get("format", "").lower()
+    score = 0
+
+    if name.endswith((".mp4", ".m4v")):
+        score += 50
+    elif name.endswith(".webm"):
+        score += 42
+    elif name.endswith(".ogv"):
+        score += 30
+    elif name.endswith(".mov"):
+        score += 20
+
+    if "h.264" in file_format or "mpeg4" in file_format:
+        score += 20
+    if "derivative" in file_info.get("source", "").lower():
+        score += 6
+
+    try:
+        size = int(file_info.get("size", 0))
+    except (TypeError, ValueError):
+        size = 0
+    if size > 2_000_000:
+        score += 8
+
+    return score
+
+
+def best_archive_video_file(files):
+    video_files = [file_info for file_info in files if archive_file_is_video(file_info)]
+    if not video_files:
+        return None
+
+    video_files.sort(key=archive_video_file_score, reverse=True)
+    return video_files[0]
+
+
+def fetch_archive_metadata(identifier):
+    if not identifier:
+        return None
+
+    try:
+        request = Request(f"{ARCHIVE_METADATA_URL}/{quote(identifier, safe='')}", headers=HTTP_HEADERS)
+        with urlopen(request, timeout=8) as response:
+            return json.load(response)
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return None
+
+
+def search_archive_items(query):
+    clean_query = sanitize_search_query(query)
+    if not clean_query:
+        return []
+
     params = urlencode(
-        {
-            "action": "query",
-            "format": "json",
-            "generator": "search",
-            "gsrnamespace": 6,
-            "gsrsearch": query,
-            "gsrlimit": COMMONS_VIDEO_SEARCH_LIMIT,
-            "prop": "imageinfo",
-            "iiprop": "url|mime|size",
-        }
+        [
+            ("q", f"({clean_query}) AND mediatype:(movies)"),
+            ("fl[]", "identifier"),
+            ("fl[]", "title"),
+            ("fl[]", "description"),
+            ("fl[]", "subject"),
+            ("rows", str(ARCHIVE_VIDEO_SEARCH_LIMIT)),
+            ("page", "1"),
+            ("output", "json"),
+        ]
     )
 
     try:
-        request = Request(f"{COMMONS_API_URL}?{params}", headers=HTTP_HEADERS)
+        request = Request(f"{ARCHIVE_SEARCH_URL}?{params}", headers=HTTP_HEADERS)
         with urlopen(request, timeout=8) as response:
             data = json.load(response)
     except (HTTPError, URLError, TimeoutError, ValueError, OSError):
         return []
 
+    return data.get("response", {}).get("docs", [])
+
+
+def search_archive_videos(query, estimate, recommendation, require_blade_match):
     candidates = []
     blade_count = estimate["blades"]
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        media_info = page.get("imageinfo", [])
-        if not media_info:
+
+    for item in search_archive_items(query)[:ARCHIVE_ITEMS_PER_QUERY]:
+        identifier = item.get("identifier", "")
+        metadata = fetch_archive_metadata(identifier)
+        if not metadata:
             continue
 
-        info = media_info[0]
-        mime_type = info.get("mime", "")
-        video_url = info.get("url", "")
+        file_info = best_archive_video_file(metadata.get("files", []))
+        if not file_info:
+            continue
+
+        item_metadata = metadata.get("metadata", {})
+        title = clean_metadata_text(item_metadata.get("title") or item.get("title") or identifier)
+        description = clean_metadata_text(item_metadata.get("description") or item.get("description", ""))
+        subject = clean_metadata_text(item_metadata.get("subject") or item.get("subject", ""))
+        file_name = file_info.get("name", "")
+        video_url = archive_download_url(identifier, file_name)
         if not video_url:
             continue
 
-        if not (
-            mime_type.startswith("video/")
-            or video_url.lower().endswith((".mp4", ".webm", ".ogv", ".mov"))
-        ):
-            continue
-
         candidate = {
-            "title": page.get("title", ""),
+            "title": title,
+            "description": description,
+            "subject": subject,
+            "identifier": identifier,
+            "file_name": file_name,
             "url": video_url,
-            "page_url": commons_page_url(page.get("title", "")),
-            "mime": mime_type,
+            "page_url": archive_details_url(identifier),
+            "mime": archive_file_mime(file_name),
             "query": query,
+            "provider": "Internet Archive",
         }
-        if require_blade_match and not has_blade_match(f"{candidate['title']} {candidate['url']}", blade_count):
+        if require_blade_match and not has_blade_match(
+            f"{candidate['title']} {candidate['description']} {candidate['subject']} {candidate['file_name']}",
+            blade_count,
+        ):
             continue
 
         candidate["score"] = score_video_candidate(candidate, estimate, recommendation)
@@ -695,18 +835,18 @@ def search_commons_videos(query, estimate, recommendation, require_blade_match):
     return sort_video_candidates(candidates)
 
 
-def fetch_commons_search_video(search_groups, ship_type, speed_knots, estimate, recommendation, status_callback=None):
+def fetch_archive_search_video(search_groups, ship_type, speed_knots, estimate, recommendation, status_callback=None):
     candidates = []
     exact_queries = list(search_groups["exact"])[:MAX_EXACT_VIDEO_QUERY_ATTEMPTS]
     broad_queries = list(search_groups["broad"])[:MAX_BROAD_VIDEO_QUERY_ATTEMPTS]
 
     if status_callback:
-        status_callback("Searching exact online video matches...", "جاري البحث عن فيديوهات مطابقة بدقة...")
+        status_callback("Searching exact public video archive matches...", "جاري البحث عن فيديوهات أرشيفية مطابقة بدقة...")
 
     for query in exact_queries:
         candidates = merge_video_candidates(
             candidates,
-            search_commons_videos(query, estimate, recommendation, True),
+            search_archive_videos(query, estimate, recommendation, True),
         )
 
     if status_callback:
@@ -722,16 +862,16 @@ def fetch_commons_search_video(search_groups, ship_type, speed_knots, estimate, 
     for query in llama_queries:
         candidates = merge_video_candidates(
             candidates,
-            search_commons_videos(query, estimate, recommendation, False),
+            search_archive_videos(query, estimate, recommendation, False),
         )
 
     if status_callback:
-        status_callback("Searching broader online video candidates...", "جاري البحث عن فيديوهات أوسع صلة...")
+        status_callback("Searching broader public video archive candidates...", "جاري البحث عن فيديوهات أرشيفية أوسع صلة...")
 
     for query in broad_queries:
         candidates = merge_video_candidates(
             candidates,
-            search_commons_videos(query, estimate, recommendation, False),
+            search_archive_videos(query, estimate, recommendation, False),
         )
 
     if not candidates:
@@ -744,15 +884,15 @@ def fetch_commons_search_video(search_groups, ship_type, speed_knots, estimate, 
     if llama_choice is not None:
         return {
             "video": llama_choice["candidate"],
-            "source": "Llama-ranked online match",
-            "source_ar": "نتيجة من الإنترنت رتبها Llama",
+            "source": "Llama-ranked archive video",
+            "source_ar": "فيديو أرشيفي رتبه Llama",
             "reason": llama_choice["reason"],
         }
 
     return {
         "video": candidates[0],
-        "source": "Algorithm-ranked online match",
-        "source_ar": "نتيجة من الإنترنت رتبتها الخوارزمية",
+        "source": "Algorithm-ranked archive video",
+        "source_ar": "فيديو أرشيفي رتبته الخوارزمية",
         "reason": "",
     }
 
@@ -829,7 +969,7 @@ def build_ffmpeg_command(video_url, width, height):
 
     scale_filter = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0xf8fafc,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,"
         f"fps={VIDEO_FPS}"
     )
     return [
@@ -1085,7 +1225,7 @@ def load_video(search_groups, ship_type, speed_knots, estimate, recommendation):
             f"جاري البحث عبر الإنترنت عن فيديو رفاس بعدد {estimate['blades']} شفرات مطابق للمواصفات...",
         )
     )
-    set_video_status(t("Searching Wikimedia Commons videos with Llama assistance...", "جاري البحث في فيديوهات ويكيميديا كومنز بمساعدة Llama..."))
+    set_video_status(t("Searching public archive videos with Llama assistance...", "جاري البحث في فيديوهات الأرشيف العام بمساعدة Llama..."))
     set_video_buttons_state()
 
     def publish_status(en_message, ar_message):
@@ -1095,7 +1235,7 @@ def load_video(search_groups, ship_type, speed_knots, estimate, recommendation):
             pass
 
     def worker():
-        video_result = fetch_commons_search_video(
+        video_result = fetch_archive_search_video(
             search_groups,
             ship_type,
             speed_knots,
@@ -1181,22 +1321,93 @@ def change_lang(event=None):
 
 
 def configure_styles():
-    style.configure("App.TFrame", background="#edf2f7")
-    style.configure("Panel.TLabelframe", background="#ffffff", bordercolor="#d0d7de", relief="solid")
+    style.configure("App.TFrame", background=APP_BG)
+    style.configure("Header.TFrame", background=APP_BG)
+    style.configure("Panel.TLabelframe", background=SURFACE, bordercolor=BORDER, relief="solid")
     style.configure(
         "Panel.TLabelframe.Label",
-        background="#edf2f7",
-        foreground="#1f2937",
+        background=APP_BG,
+        foreground=TEXT,
         font=app_font(11, "bold"),
     )
-    style.configure("Panel.TFrame", background="#ffffff")
-    style.configure("Title.TLabel", background="#edf2f7", foreground="#111827", font=app_font(20, "bold"))
-    style.configure("HeaderField.TLabel", background="#edf2f7", foreground="#374151", font=app_font(10))
-    style.configure("Field.TLabel", background="#ffffff", foreground="#374151", font=app_font(10))
-    style.configure("Result.TLabel", background="#ffffff", foreground="#111827", font=app_font(10), justify="right" if lang == "ar" else "left")
-    style.configure("Error.TLabel", background="#ffffff", foreground="#b42318", font=app_font(10, "bold"), justify="right" if lang == "ar" else "left")
-    style.configure("Accent.TButton", font=app_font(10, "bold"), padding=(12, 8))
-    style.configure("Plain.TButton", font=app_font(10), padding=(12, 8))
+    style.configure("Panel.TFrame", background=SURFACE)
+    style.configure("Title.TLabel", background=APP_BG, foreground=TEXT, font=app_font(24, "bold"))
+    style.configure("HeaderField.TLabel", background=APP_BG, foreground=MUTED_TEXT, font=app_font(10))
+    style.configure("Field.TLabel", background=SURFACE, foreground=MUTED_TEXT, font=app_font(10))
+    style.configure(
+        "TEntry",
+        bordercolor=BORDER,
+        fieldbackground=SURFACE_SOFT,
+        foreground=TEXT,
+        lightcolor=BORDER,
+        padding=7,
+    )
+    style.configure(
+        "TCombobox",
+        arrowsize=14,
+        bordercolor=BORDER,
+        fieldbackground=SURFACE_SOFT,
+        foreground=TEXT,
+        lightcolor=BORDER,
+        padding=7,
+    )
+    style.configure(
+        "Result.TLabel",
+        background=SURFACE,
+        foreground=TEXT,
+        font=app_font(10),
+        justify="right" if lang == "ar" else "left",
+    )
+    style.configure(
+        "Error.TLabel",
+        background=SURFACE,
+        foreground=DANGER,
+        font=app_font(10, "bold"),
+        justify="right" if lang == "ar" else "left",
+    )
+    style.configure(
+        "Accent.TButton",
+        background=ACCENT,
+        bordercolor=ACCENT,
+        darkcolor=ACCENT,
+        foreground="#ffffff",
+        focuscolor=ACCENT,
+        font=app_font(10, "bold"),
+        lightcolor=ACCENT,
+        padding=(14, 9),
+        relief="flat",
+    )
+    style.map(
+        "Accent.TButton",
+        background=[("active", ACCENT_DARK), ("disabled", "#9fb8b5")],
+        foreground=[("disabled", "#ecfdf5")],
+    )
+    style.configure(
+        "Plain.TButton",
+        background="#e8eef5",
+        bordercolor="#d6e0ea",
+        foreground=TEXT,
+        focuscolor="#e8eef5",
+        font=app_font(10),
+        padding=(14, 9),
+        relief="flat",
+    )
+    style.map(
+        "Plain.TButton",
+        background=[("active", "#dbe7f3"), ("disabled", "#edf2f7")],
+        foreground=[("disabled", "#94a3b8")],
+    )
+    style.configure(
+        "Secondary.TButton",
+        background=SECONDARY,
+        bordercolor=SECONDARY,
+        foreground="#ffffff",
+        focuscolor=SECONDARY,
+        font=app_font(10, "bold"),
+        padding=(14, 9),
+        relief="flat",
+    )
+    style.map("Secondary.TButton", background=[("active", SECONDARY_DARK), ("disabled", "#9bb7ea")])
 
 
 def apply_language_layout():
@@ -1241,11 +1452,13 @@ def refresh_language():
     power_label.config(text=t("Power (kW)", "القدرة (kW)"))
     speed_label.config(text=t("Speed (knots)", "السرعة (عقدة)"))
     ship_label.config(text=t("Ship Type", "نوع السفينة"))
+    entry_power.config(font=app_font(11))
+    entry_speed.config(font=app_font(11))
     calculate_button.config(text=t("Calculate", "احسب"))
     reset_button.config(text=t("Reset", "إعادة ضبط"))
     result_frame.config(text=t("Estimate", "التقدير"))
     recommendation_frame.config(text=t("Recommendation", "التوصية"))
-    video_frame.config(text=t("Video", "الفيديو"))
+    video_frame.config(text=t("Visualizer", "العارض"))
     video_size_label.config(text=t("Video width", "عرض الفيديو"))
     video_play_button.config(text=t("Play", "تشغيل"))
     video_pause_button.config(text=t("Pause", "إيقاف مؤقت"))
@@ -1267,14 +1480,22 @@ def update_scroll_region(event=None):
 
 def resize_scroll_frame(event):
     requested_width = main_frame.winfo_reqwidth()
-    scroll_canvas.itemconfigure(main_window, width=max(event.width, requested_width))
+    requested_height = main_frame.winfo_reqheight()
+    scroll_canvas.itemconfigure(
+        main_window,
+        width=max(event.width, requested_width),
+        height=max(event.height, requested_height),
+    )
 
     if "result_label" in globals():
-        wraplength = max(260, event.width - 96)
-        result_label.config(wraplength=wraplength)
-        recommendation_label.config(wraplength=wraplength)
+        side_width = side_column.winfo_width() if "side_column" in globals() else 0
+        visualizer_width = visualizer_column.winfo_width() if "visualizer_column" in globals() else 0
+        info_wrap = max(260, side_width - 52) if side_width > 1 else max(280, event.width // 3)
+        video_wrap = max(280, visualizer_width - 52) if visualizer_width > 1 else max(320, event.width // 2)
+        result_label.config(wraplength=info_wrap)
+        recommendation_label.config(wraplength=info_wrap)
         if "video_status_label" in globals():
-            video_status_label.config(wraplength=wraplength)
+            video_status_label.config(wraplength=video_wrap)
 
 
 def on_mousewheel(event):
@@ -1297,9 +1518,9 @@ def close_app():
 
 
 root = tk.Tk()
-root.geometry("640x780")
-root.minsize(420, 480)
-root.configure(bg="#edf2f7")
+root.geometry("1120x760")
+root.minsize(920, 620)
+root.configure(bg=APP_BG)
 root.rowconfigure(0, weight=1)
 root.columnconfigure(0, weight=1)
 
@@ -1314,7 +1535,7 @@ except tk.TclError:
     pass
 configure_styles()
 
-scroll_canvas = tk.Canvas(root, bg="#edf2f7", highlightthickness=0)
+scroll_canvas = tk.Canvas(root, bg=APP_BG, highlightthickness=0)
 vertical_scrollbar = ttk.Scrollbar(root, orient="vertical", command=scroll_canvas.yview)
 horizontal_scrollbar = ttk.Scrollbar(root, orient="horizontal", command=scroll_canvas.xview)
 scroll_canvas.configure(
@@ -1325,7 +1546,7 @@ scroll_canvas.grid(row=0, column=0, sticky="nsew")
 vertical_scrollbar.grid(row=0, column=1, sticky="ns")
 horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
 
-main_frame = ttk.Frame(scroll_canvas, padding=24, style="App.TFrame")
+main_frame = ttk.Frame(scroll_canvas, padding=(28, 24), style="App.TFrame")
 main_window = scroll_canvas.create_window((0, 0), window=main_frame, anchor="nw")
 main_frame.bind("<Configure>", update_scroll_region)
 scroll_canvas.bind("<Configure>", resize_scroll_frame)
@@ -1333,15 +1554,16 @@ root.bind_all("<MouseWheel>", on_mousewheel)
 root.bind_all("<Button-4>", on_mousewheel)
 root.bind_all("<Button-5>", on_mousewheel)
 main_frame.columnconfigure(0, weight=1)
+main_frame.rowconfigure(1, weight=1)
 
-header_frame = ttk.Frame(main_frame, style="App.TFrame")
+header_frame = ttk.Frame(main_frame, style="Header.TFrame")
 header_frame.grid(row=0, column=0, sticky="ew")
 header_frame.columnconfigure(0, weight=1)
 
 title_label = ttk.Label(header_frame, style="Title.TLabel")
 title_label.grid(row=0, column=0, sticky="w")
 
-language_frame = ttk.Frame(header_frame, style="App.TFrame")
+language_frame = ttk.Frame(header_frame, style="Header.TFrame")
 language_frame.grid(row=0, column=1, sticky="e")
 
 language_label = ttk.Label(language_frame, style="HeaderField.TLabel")
@@ -1352,8 +1574,28 @@ lang_combo.grid(row=0, column=1)
 lang_combo.set(lang)
 lang_combo.bind("<<ComboboxSelected>>", change_lang)
 
-input_frame = ttk.LabelFrame(main_frame, padding=16, style="Panel.TLabelframe")
-input_frame.grid(row=1, column=0, sticky="ew", pady=(18, 12))
+accent_bar = tk.Frame(header_frame, height=4, bg=ACCENT)
+accent_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+
+body_frame = ttk.Frame(main_frame, style="App.TFrame")
+body_frame.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
+body_frame.columnconfigure(0, weight=3, minsize=520)
+body_frame.columnconfigure(1, weight=2, minsize=340)
+body_frame.rowconfigure(0, weight=1)
+
+visualizer_column = ttk.Frame(body_frame, style="App.TFrame")
+visualizer_column.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+visualizer_column.columnconfigure(0, weight=1)
+visualizer_column.rowconfigure(0, weight=1)
+
+side_column = ttk.Frame(body_frame, style="App.TFrame")
+side_column.grid(row=0, column=1, sticky="nsew", padx=(18, 0))
+side_column.columnconfigure(0, weight=1)
+side_column.rowconfigure(1, weight=1)
+side_column.rowconfigure(2, weight=1)
+
+input_frame = ttk.LabelFrame(side_column, padding=(18, 16), style="Panel.TLabelframe")
+input_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
 input_frame.columnconfigure(1, weight=1)
 
 power_label = ttk.Label(input_frame, style="Field.TLabel")
@@ -1382,25 +1624,27 @@ calculate_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 reset_button = ttk.Button(button_frame, command=reset, style="Plain.TButton")
 reset_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-result_frame = ttk.LabelFrame(main_frame, padding=16, style="Panel.TLabelframe")
-result_frame.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+result_frame = ttk.LabelFrame(side_column, padding=(18, 16), style="Panel.TLabelframe")
+result_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 14))
 result_frame.columnconfigure(0, weight=1)
+result_frame.rowconfigure(0, weight=1)
 
 result_label = ttk.Label(result_frame, text="", wraplength=540, style="Result.TLabel")
-result_label.grid(row=0, column=0, sticky="w")
+result_label.grid(row=0, column=0, sticky="new")
 
-recommendation_frame = ttk.LabelFrame(main_frame, padding=16, style="Panel.TLabelframe")
-recommendation_frame.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+recommendation_frame = ttk.LabelFrame(side_column, padding=(18, 16), style="Panel.TLabelframe")
+recommendation_frame.grid(row=2, column=0, sticky="nsew")
 recommendation_frame.columnconfigure(0, weight=1)
+recommendation_frame.rowconfigure(0, weight=1)
 
 recommendation_label = ttk.Label(recommendation_frame, text="", wraplength=540, style="Result.TLabel")
-recommendation_label.grid(row=0, column=0, sticky="w")
+recommendation_label.grid(row=0, column=0, sticky="new")
 
-video_frame = ttk.LabelFrame(main_frame, padding=16, style="Panel.TLabelframe")
-video_frame.grid(row=4, column=0, sticky="ew")
+video_frame = ttk.LabelFrame(visualizer_column, padding=(18, 16), style="Panel.TLabelframe")
+video_frame.grid(row=0, column=0, sticky="nsew")
 
 video_button_frame = ttk.Frame(video_frame, style="Panel.TFrame")
-video_button_frame.pack(fill="x", pady=(0, 10))
+video_button_frame.pack(side="bottom", fill="x", pady=(12, 0))
 for column in range(4):
     video_button_frame.columnconfigure(column, weight=1)
 
@@ -1428,12 +1672,12 @@ video_restart_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
 video_open_button = ttk.Button(
     video_button_frame,
     command=open_current_video,
-    style="Plain.TButton",
+    style="Secondary.TButton",
 )
 video_open_button.grid(row=0, column=3, sticky="ew")
 
 video_size_frame = ttk.Frame(video_frame, style="Panel.TFrame")
-video_size_frame.pack(fill="x", pady=(0, 10))
+video_size_frame.pack(side="bottom", fill="x", pady=(10, 0))
 video_size_frame.columnconfigure(1, weight=1)
 
 video_size_label = ttk.Label(video_size_frame, style="Field.TLabel")
@@ -1459,24 +1703,24 @@ video_size_reset_button = ttk.Button(
 video_size_reset_button.grid(row=0, column=3, sticky="e")
 
 video_status_label = ttk.Label(video_frame, text="", wraplength=540, style="Field.TLabel")
-video_status_label.pack(fill="x", pady=(0, 10))
+video_status_label.pack(side="bottom", fill="x", pady=(10, 0))
 
 initial_video_width, initial_video_height = current_video_size()
 video_panel = tk.Frame(
     video_frame,
     width=initial_video_width,
     height=initial_video_height,
-    bg="#f8fafc",
-    highlightbackground="#d0d7de",
+    bg=VIDEO_SURFACE,
+    highlightbackground=ACCENT,
     highlightthickness=1,
 )
-video_panel.pack(anchor="center")
+video_panel.pack(fill="both", expand=True, pady=(6, 0))
 video_panel.pack_propagate(False)
 
 video_label = tk.Label(
     video_panel,
-    bg="#f8fafc",
-    fg="#6b7280",
+    bg=VIDEO_SURFACE,
+    fg="#dbeafe",
     font=app_font(10),
     justify="center",
     wraplength=400,
