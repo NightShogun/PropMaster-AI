@@ -1,33 +1,35 @@
 import json
 import math
-import os
 import random
 import re
+import shutil
+import subprocess
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
-from io import BytesIO
-from pathlib import Path
 from tkinter import ttk
+import webbrowser
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 try:
-    from PIL import Image, ImageOps, ImageTk, UnidentifiedImageError
+    from PIL import Image, ImageTk
 except ImportError as exc:
     raise SystemExit("Install Pillow first: pip install pillow") from exc
 
 
-DEFAULT_IMAGE_WIDTH = 450
-DEFAULT_IMAGE_HEIGHT = 250
-IMAGE_ASPECT_RATIO = DEFAULT_IMAGE_HEIGHT / DEFAULT_IMAGE_WIDTH
-MIN_IMAGE_WIDTH = 260
-MAX_IMAGE_WIDTH = 680
-LOCAL_IMAGE_DIR = Path(__file__).resolve().parent / "images"
-RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+DEFAULT_VIDEO_WIDTH = 450
+DEFAULT_VIDEO_HEIGHT = 250
+VIDEO_ASPECT_RATIO = DEFAULT_VIDEO_HEIGHT / DEFAULT_VIDEO_WIDTH
+MIN_VIDEO_WIDTH = 260
+MAX_VIDEO_WIDTH = 680
+VIDEO_FPS = 24
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
-COMMONS_SEARCH_LIMIT = 24
+COMMONS_VIDEO_SEARCH_LIMIT = 32
+MAX_EXACT_VIDEO_QUERY_ATTEMPTS = 6
+MAX_BROAD_VIDEO_QUERY_ATTEMPTS = 12
 HTTP_HEADERS = {
     "User-Agent": "MarinePropellerAdvisor/1.0 (educational tkinter app)",
 }
@@ -83,8 +85,13 @@ BLADE_WORDS = {
 }
 
 lang = "en"
-image_request_id = 0
-current_display_image = None
+video_request_id = 0
+video_session_id = 0
+current_video = None
+video_process = None
+video_playing = False
+video_paused = False
+video_frame_seen = False
 
 
 def t(en, ar):
@@ -169,31 +176,79 @@ def has_blade_match(text, blade_count):
     return any(phrase in normalized_text for phrase in blade_phrases(blade_count))
 
 
-def score_image_candidate(candidate, blade_count, recommendation):
+def video_title(title):
+    cleaned_title = title.replace("File:", "", 1).replace("_", " ").strip()
+    return cleaned_title or t("Online propeller video", "فيديو رفاس من الإنترنت")
+
+
+def commons_page_url(title):
+    if not title:
+        return ""
+
+    return "https://commons.wikimedia.org/wiki/" + quote(title.replace(" ", "_"), safe=":/")
+
+
+def estimate_spec_text(estimate):
+    return (
+        f"{estimate['blades']}-blade, "
+        f"{estimate['diameter']:.2f} m diameter, "
+        f"{estimate['pitch']:.2f} m pitch, "
+        f"{estimate['rpm']:.0f} RPM"
+    )
+
+
+def number_tokens(value):
+    return {
+        f"{value:.2f}",
+        f"{value:.1f}",
+        str(round(value)),
+    }
+
+
+def score_video_candidate(candidate, estimate, recommendation):
     title = candidate.get("title", "")
-    image_url = candidate.get("url", "")
-    searchable_text = normalized_search_text(f"{title} {image_url}")
+    video_url = candidate.get("url", "")
+    raw_text = f"{title} {video_url}".lower()
+    searchable_text = normalized_search_text(raw_text)
     score = 0
+    blade_count = estimate["blades"]
 
     if has_blade_match(searchable_text, blade_count):
-        score += 100
+        score += 120
 
-    if "propeller" in searchable_text:
-        score += 20
+    if "propeller" in searchable_text or "screw" in searchable_text:
+        score += 50
 
-    if "ship" in searchable_text or "marine" in searchable_text:
-        score += 12
+    if "ship" in searchable_text or "marine" in searchable_text or "vessel" in searchable_text:
+        score += 35
+
+    if "video" in searchable_text:
+        score += 10
 
     if recommendation["kind"] == "controllable" and "controllable" in searchable_text:
-        score += 20
+        score += 35
     elif recommendation["kind"] == "ducted" and (
         "ducted" in searchable_text or "kort" in searchable_text or "nozzle" in searchable_text
     ):
-        score += 20
+        score += 35
     elif recommendation["kind"] == "fixed" and ("fixed" in searchable_text or "screw" in searchable_text):
-        score += 10
+        score += 20
+
+    for token in number_tokens(estimate["rpm"]):
+        if token in raw_text:
+            score += 15
+            break
+
+    for dimension in ("diameter", "pitch"):
+        for token in number_tokens(estimate[dimension]):
+            if token in raw_text or f"{token}m" in raw_text:
+                score += 15
+                break
 
     if "aircraft" in searchable_text or "aeroplane" in searchable_text or "airplane" in searchable_text:
+        score -= 80
+
+    if "fan" in searchable_text:
         score -= 25
 
     return score
@@ -289,122 +344,105 @@ def slip_note(slip):
     return ""
 
 
-def build_image_queries(ship_type, speed_knots, estimate, recommendation):
+def build_video_queries(ship_type, speed_knots, estimate, recommendation):
     ship_term = SHIP_SEARCH_TERMS.get(ship_type, f"{ship_type} ship")
     blade_count = estimate["blades"]
     efficiency_percent = estimate["efficiency"] * 100
     slip = estimate["slip"]
     blade_word = BLADE_WORDS.get(blade_count, str(blade_count))
+    diameter = estimate["diameter"]
+    pitch = estimate["pitch"]
+    rpm = estimate["rpm"]
 
-    exact_blade_queries = [
-        f"{blade_word} blade ship propeller",
-        f"{blade_word}-bladed ship propeller",
-        f"{blade_count} blade ship propeller",
-        f"{blade_count}-blade marine propeller",
-        f"{blade_word} blade {recommendation['query']}",
-        f"{blade_count} blade {recommendation['query']}",
+    exact_spec_queries = [
+        f"{blade_count} blade {recommendation['query']} {diameter:.2f} m diameter {pitch:.2f} m pitch {rpm:.0f} rpm video",
+        f"{blade_word} blade {recommendation['query']} {ship_term} propeller video",
+        f"{blade_count} blade marine propeller {ship_term} video",
+        f"{blade_count} blade marine propeller {ship_term}",
+        f"{blade_word}-bladed ship propeller video",
+        f"{blade_count}-blade {recommendation['query']} video",
     ]
 
     broad_queries = [
+        f"{recommendation['query']} {ship_term} video",
+        f"{blade_word} blade propeller video",
+        f"{blade_count} blade propeller video",
+        f"{ship_term} propeller video",
+        f"{ship_term} {recommendation['en']} video",
+        f"{speed_knots:.0f} knot {ship_term} propeller video",
+        f"{recommendation['query']} video",
+        "marine propeller video",
+        "ship propeller video",
+        "boat propeller video",
+        "propeller video",
+        "video of propeller",
         f"{recommendation['query']} {ship_term}",
-        f"{blade_word} blade propeller",
-        f"{blade_count} blade propeller",
         f"{ship_term} propeller",
-        f"{ship_term} {recommendation['en']}",
         recommendation["query"],
         "marine propeller",
+        "ship propeller",
     ]
 
     if recommendation["kind"] == "controllable":
-        exact_blade_queries.extend(
+        exact_spec_queries.extend(
             [
-                f"{blade_word} blade controllable pitch propeller",
-                f"{blade_count} blade controllable pitch propeller",
+                f"{blade_word} blade controllable pitch propeller video",
+                f"{blade_count} blade controllable pitch propeller video",
             ]
         )
         broad_queries.extend(
             [
-                f"high speed marine propeller {ship_term}",
-                "high speed marine propeller",
-                "controllable pitch propeller ship",
+                f"high speed marine propeller {ship_term} video",
+                "high speed marine propeller video",
+                "controllable pitch propeller ship video",
             ]
         )
     elif recommendation["kind"] == "ducted":
-        exact_blade_queries.extend(
+        exact_spec_queries.extend(
             [
-                f"{blade_word} blade ducted propeller",
-                f"{blade_count} blade ducted propeller",
+                f"{blade_word} blade ducted propeller video",
+                f"{blade_count} blade ducted propeller video",
             ]
         )
         broad_queries.extend(
             [
-                f"Kort nozzle propeller {ship_term}",
-                f"ducted propeller {ship_term}",
-                "Kort nozzle",
-                "tugboat ducted propeller drydock",
+                f"Kort nozzle propeller {ship_term} video",
+                f"ducted propeller {ship_term} video",
+                "Kort nozzle propeller video",
+                "tugboat ducted propeller video",
             ]
         )
     else:
-        exact_blade_queries.extend(
+        exact_spec_queries.extend(
             [
-                f"{blade_word} blade fixed pitch propeller",
-                f"{blade_count} blade fixed pitch propeller",
+                f"{blade_word} blade fixed pitch propeller video",
+                f"{blade_count} blade fixed pitch propeller video",
             ]
         )
         broad_queries.extend(
             [
-                f"fixed pitch propeller {ship_term}",
-                f"ship propeller drydock {ship_term}",
-                "ship propeller drydock",
-                "marine screw propeller ship",
+                f"fixed pitch propeller {ship_term} video",
+                f"ship propeller drydock {ship_term} video",
+                "ship propeller drydock video",
+                "marine screw propeller ship video",
             ]
         )
 
     if slip < 0:
-        broad_queries.append(f"high speed ship propeller {ship_term}")
+        broad_queries.append(f"high speed ship propeller {ship_term} video")
     elif slip > 0.6:
-        broad_queries.append(f"low speed thrust propeller {ship_term}")
+        broad_queries.append(f"low speed thrust propeller {ship_term} video")
 
     if efficiency_percent < 65:
-        broad_queries.append(f"marine propeller cavitation {ship_term}")
+        broad_queries.append(f"marine propeller cavitation {ship_term} video")
 
     return {
-        "exact": dedupe(exact_blade_queries),
+        "exact": dedupe(exact_spec_queries),
         "broad": dedupe(broad_queries),
     }
 
 
-def fetch_unsplash_image(search_groups):
-    access_key = os.getenv("UNSPLASH_ACCESS_KEY", "").strip()
-    if not access_key:
-        return None
-
-    try:
-        query = random.choice(search_groups["exact"] or search_groups["broad"])
-        api_url = "https://api.unsplash.com/photos/random?" + urlencode(
-            {"query": query, "orientation": "landscape"}
-        )
-        request = Request(
-            api_url,
-            headers={
-                **HTTP_HEADERS,
-                "Authorization": f"Client-ID {access_key}",
-                "Accept-Version": "v1",
-            },
-        )
-        with urlopen(request, timeout=8) as api_response:
-            data = json.load(api_response)
-
-        image_url = data.get("urls", {}).get("regular")
-        if not image_url:
-            return None
-
-        return fetch_url_image(image_url)
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError, UnidentifiedImageError):
-        return None
-
-
-def search_commons_images(query, blade_count, recommendation, require_blade_match):
+def search_commons_videos(query, estimate, recommendation, require_blade_match):
     params = urlencode(
         {
             "action": "query",
@@ -412,10 +450,9 @@ def search_commons_images(query, blade_count, recommendation, require_blade_matc
             "generator": "search",
             "gsrnamespace": 6,
             "gsrsearch": query,
-            "gsrlimit": COMMONS_SEARCH_LIMIT,
+            "gsrlimit": COMMONS_VIDEO_SEARCH_LIMIT,
             "prop": "imageinfo",
             "iiprop": "url|mime|size",
-            "iiurlwidth": 900,
         }
     )
 
@@ -427,34 +464,35 @@ def search_commons_images(query, blade_count, recommendation, require_blade_matc
         return []
 
     candidates = []
+    blade_count = estimate["blades"]
     pages = data.get("query", {}).get("pages", {})
     for page in pages.values():
-        image_info = page.get("imageinfo", [])
-        if not image_info:
+        media_info = page.get("imageinfo", [])
+        if not media_info:
             continue
 
-        info = image_info[0]
+        info = media_info[0]
         mime_type = info.get("mime", "")
-        if not mime_type.startswith("image/"):
+        video_url = info.get("url", "")
+        if not video_url:
             continue
 
-        image_url = info.get("thumburl") or info.get("url")
-        if not image_url:
-            continue
-
-        width = info.get("thumbwidth") or info.get("width") or 0
-        height = info.get("thumbheight") or info.get("height") or 0
-        if width < 250 or height < 150:
+        if not (
+            mime_type.startswith("video/")
+            or video_url.lower().endswith((".mp4", ".webm", ".ogv", ".mov"))
+        ):
             continue
 
         candidate = {
             "title": page.get("title", ""),
-            "url": image_url,
+            "url": video_url,
+            "page_url": commons_page_url(page.get("title", "")),
+            "mime": mime_type,
         }
         if require_blade_match and not has_blade_match(f"{candidate['title']} {candidate['url']}", blade_count):
             continue
 
-        candidate["score"] = score_image_candidate(candidate, blade_count, recommendation)
+        candidate["score"] = score_video_candidate(candidate, estimate, recommendation)
         candidates.append(candidate)
 
     random.shuffle(candidates)
@@ -462,150 +500,354 @@ def search_commons_images(query, blade_count, recommendation, require_blade_matc
     return candidates
 
 
-def fetch_url_image(image_url):
-    try:
-        request = Request(image_url, headers=HTTP_HEADERS)
-        with urlopen(request, timeout=8) as response:
-            content_type = response.headers.get("Content-Type", "")
-            if "image" not in content_type:
-                return None
-
-            image = Image.open(BytesIO(response.read()))
-
-        image.load()
-        return image
-    except (HTTPError, URLError, TimeoutError, OSError, UnidentifiedImageError):
-        return None
-
-
-def fetch_commons_search_image(search_groups, blade_count, recommendation):
-    exact_queries = list(search_groups["exact"])
-    broad_queries = list(search_groups["broad"])
-    random.shuffle(exact_queries)
-    random.shuffle(broad_queries)
+def fetch_commons_search_video(search_groups, estimate, recommendation):
+    exact_queries = list(search_groups["exact"])[:MAX_EXACT_VIDEO_QUERY_ATTEMPTS]
+    broad_queries = list(search_groups["broad"])[:MAX_BROAD_VIDEO_QUERY_ATTEMPTS]
 
     for query in exact_queries:
-        for candidate in search_commons_images(query, blade_count, recommendation, True):
-            image = fetch_url_image(candidate["url"])
-            if image is not None:
-                return image
+        candidates = search_commons_videos(query, estimate, recommendation, True)
+        if candidates:
+            return candidates[0]
 
     for query in broad_queries:
-        for candidate in search_commons_images(query, blade_count, recommendation, False):
-            image = fetch_url_image(candidate["url"])
-            if image is not None:
-                return image
+        candidates = search_commons_videos(query, estimate, recommendation, False)
+        if candidates:
+            return candidates[0]
 
     return None
 
 
-def load_local_image(fallback_file):
-    path = LOCAL_IMAGE_DIR / fallback_file
-
-    try:
-        image = Image.open(path)
-        image.load()
-        return image
-    except (FileNotFoundError, OSError, UnidentifiedImageError):
-        return None
-
-
-def current_image_size():
-    width = round(float(image_width_var.get()))
-    height = max(150, round(width * IMAGE_ASPECT_RATIO))
+def current_video_size():
+    width = round(float(video_width_var.get()))
+    height = max(150, round(width * VIDEO_ASPECT_RATIO))
     return width, height
 
 
-def sync_image_panel_size():
-    if "image_panel" not in globals():
+def sync_video_panel_size():
+    if "video_panel" not in globals():
         return
 
-    width, height = current_image_size()
-    image_panel.config(width=width, height=height)
-    image_label.config(wraplength=max(160, width - 36))
-    if "image_size_value" in globals():
-        image_size_value.config(text=f"{width} x {height} px")
+    width, height = current_video_size()
+    video_panel.config(width=width, height=height)
+    video_label.config(wraplength=max(160, width - 36))
+    if "video_size_value" in globals():
+        video_size_value.config(text=f"{width} x {height} px")
 
 
-def prepare_image(image):
-    image_size = current_image_size()
-    fitted_image = ImageOps.contain(image.convert("RGB"), image_size, RESAMPLE)
-    canvas = Image.new("RGB", image_size, "#f8fafc")
-    offset = (
-        (image_size[0] - fitted_image.width) // 2,
-        (image_size[1] - fitted_image.height) // 2,
+def set_video_status(message):
+    if "video_status_label" in globals():
+        video_status_label.config(text=message)
+
+
+def set_video_buttons_state():
+    if "video_play_button" not in globals():
+        return
+
+    has_video = current_video is not None
+    video_play_button.config(state=tk.NORMAL if has_video and (not video_playing or video_paused) else tk.DISABLED)
+    video_pause_button.config(state=tk.NORMAL if has_video and video_playing and not video_paused else tk.DISABLED)
+    video_restart_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
+    video_open_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
+
+
+def show_video_placeholder(message):
+    sync_video_panel_size()
+    video_label.config(image="", text=message)
+    video_label.image = None
+
+
+def display_video_frame(session_id, frame):
+    global video_frame_seen
+
+    if session_id != video_session_id:
+        return
+
+    video_frame_seen = True
+    photo = ImageTk.PhotoImage(frame)
+    video_label.config(image=photo, text="")
+    video_label.image = photo
+
+
+def read_video_frame(stdout, frame_size):
+    chunks = []
+    remaining = frame_size
+
+    while remaining > 0:
+        chunk = stdout.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+
+    return b"".join(chunks)
+
+
+def build_ffmpeg_command(video_url, width, height):
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        return None
+
+    scale_filter = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0xf8fafc,"
+        f"fps={VIDEO_FPS}"
     )
-    canvas.paste(fitted_image, offset)
-    return canvas
+    return [
+        ffmpeg_path,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-user_agent",
+        HTTP_HEADERS["User-Agent"],
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "4",
+        "-i",
+        video_url,
+        "-an",
+        "-vf",
+        scale_filter,
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
 
 
-def show_image_placeholder(message):
-    global current_display_image
+def video_reader(session_id, process, width, height):
+    frame_size = width * height * 3
+    frame_delay = 1 / VIDEO_FPS
+    next_frame_time = time.monotonic()
 
-    current_display_image = None
-    sync_image_panel_size()
-    image_label.config(image="", text=message)
-    image_label.image = None
+    try:
+        while session_id == video_session_id:
+            while video_paused and session_id == video_session_id:
+                time.sleep(0.05)
+
+            frame_data = read_video_frame(process.stdout, frame_size)
+            if frame_data is None:
+                break
+
+            frame = Image.frombytes("RGB", (width, height), frame_data)
+            try:
+                root.after(0, lambda sid=session_id, image=frame: display_video_frame(sid, image))
+            except tk.TclError:
+                break
+
+            next_frame_time += frame_delay
+            delay = next_frame_time - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_frame_time = time.monotonic()
+    finally:
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+
+        try:
+            root.after(0, lambda sid=session_id: finish_video_playback(sid))
+        except tk.TclError:
+            pass
 
 
-def display_image(image):
-    global current_display_image
-
-    current_display_image = image
-    sync_image_panel_size()
-    render_displayed_image()
-
-
-def render_displayed_image():
-    if current_display_image is None:
+def terminate_video_process(process):
+    if process is None or process.poll() is not None:
         return
 
-    photo = ImageTk.PhotoImage(prepare_image(current_display_image))
-    image_label.config(image=photo, text="")
-    image_label.image = photo
+    process.terminate()
+    try:
+        process.wait(timeout=0.6)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=0.6)
+        except subprocess.TimeoutExpired:
+            pass
 
 
-def resize_displayed_image(value=None):
-    sync_image_panel_size()
-    render_displayed_image()
+def stop_video_playback(clear_frame=False):
+    global video_session_id, video_process, video_playing, video_paused, video_frame_seen
+
+    video_session_id += 1
+    process = video_process
+    video_process = None
+    video_playing = False
+    video_paused = False
+    video_frame_seen = False
+    terminate_video_process(process)
+
+    if clear_frame and "video_label" in globals():
+        show_video_placeholder(t("Video preview", "معاينة الفيديو"))
+
+    set_video_buttons_state()
 
 
-def finish_image_load(request_id, image):
-    if request_id != image_request_id:
+def start_video_playback(video):
+    global video_session_id, video_process, video_playing, video_paused, video_frame_seen
+
+    if video is None:
         return
 
-    if image is None:
-        show_image_placeholder(
+    stop_video_playback(clear_frame=False)
+    width, height = current_video_size()
+    command = build_ffmpeg_command(video["url"], width, height)
+    if command is None:
+        show_video_placeholder(
             t(
-                "No image available. Check your internet connection or add a matching file in images/.",
-                "لا توجد صورة. تحقق من اتصال الإنترنت أو أضف ملفًا مناسبًا داخل images/.",
+                "Video found, but ffmpeg is required for in-app playback. Use Open Video.",
+                "تم العثور على فيديو، لكن ffmpeg مطلوب للتشغيل داخل التطبيق. استخدم فتح الفيديو.",
             )
         )
+        set_video_status(t("Playback unavailable: ffmpeg is not installed.", "التشغيل غير متاح: ffmpeg غير مثبت."))
+        set_video_buttons_state()
         return
 
-    display_image(image)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=width * height * 3,
+        )
+    except OSError as exc:
+        show_video_placeholder(t("Could not start video playback.", "تعذر بدء تشغيل الفيديو."))
+        set_video_status(str(exc))
+        set_video_buttons_state()
+        return
+
+    video_session_id += 1
+    session_id = video_session_id
+    video_process = process
+    video_playing = True
+    video_paused = False
+    video_frame_seen = False
+    show_video_placeholder(t("Starting video...", "جاري بدء الفيديو..."))
+    set_video_status(t(f"Playing: {video_title(video['title'])}", f"تشغيل: {video_title(video['title'])}"))
+    set_video_buttons_state()
+    threading.Thread(target=video_reader, args=(session_id, process, width, height), daemon=True).start()
 
 
-def load_image(search_groups, blade_count, recommendation, fallback_file):
-    global image_request_id
+def finish_video_playback(session_id):
+    global video_process, video_playing, video_paused
 
-    image_request_id += 1
-    request_id = image_request_id
-    show_image_placeholder(
+    if session_id != video_session_id:
+        return
+
+    video_process = None
+    video_playing = False
+    video_paused = False
+    if not video_frame_seen:
+        show_video_placeholder(
+            t(
+                "Video found, but playback could not start. Use Open Video.",
+                "تم العثور على فيديو، لكن تعذر تشغيله. استخدم فتح الفيديو.",
+            )
+        )
+        set_video_status(t("Playback failed for this online video.", "فشل تشغيل هذا الفيديو من الإنترنت."))
+    else:
+        set_video_status(t("Video ended. Use Restart to replay.", "انتهى الفيديو. استخدم إعادة التشغيل للمشاهدة مرة أخرى."))
+
+    set_video_buttons_state()
+
+
+def play_current_video():
+    global video_paused
+
+    if current_video is None:
+        return
+
+    if video_playing and video_paused:
+        video_paused = False
+        set_video_status(t(f"Playing: {video_title(current_video['title'])}", f"تشغيل: {video_title(current_video['title'])}"))
+        set_video_buttons_state()
+        return
+
+    start_video_playback(current_video)
+
+
+def pause_current_video():
+    global video_paused
+
+    if not video_playing:
+        return
+
+    video_paused = True
+    set_video_status(t("Paused.", "متوقف مؤقتًا."))
+    set_video_buttons_state()
+
+
+def restart_current_video():
+    if current_video is not None:
+        start_video_playback(current_video)
+
+
+def open_current_video():
+    if current_video is None:
+        return
+
+    webbrowser.open(current_video.get("page_url") or current_video["url"])
+
+
+def resize_video_display(value=None):
+    sync_video_panel_size()
+
+
+def finish_video_load(request_id, video):
+    global current_video
+
+    if request_id != video_request_id:
+        return
+
+    if video is None:
+        current_video = None
+        show_video_placeholder(
+            t(
+                "No matching online video found. Check your internet connection and try again.",
+                "لم يتم العثور على فيديو مطابق من الإنترنت. تحقق من الاتصال ثم حاول مرة أخرى.",
+            )
+        )
+        set_video_status("")
+        set_video_buttons_state()
+        return
+
+    current_video = video
+    set_video_status(
         t(
-            f"Searching for a {blade_count}-blade propeller image...",
-            f"جاري البحث عن صورة رفاس بعدد {blade_count} شفرات...",
+            f"Best online match: {video_title(video['title'])}",
+            f"أفضل نتيجة من الإنترنت: {video_title(video['title'])}",
         )
     )
+    set_video_buttons_state()
+    start_video_playback(video)
+
+
+def load_video(search_groups, estimate, recommendation):
+    global video_request_id, current_video
+
+    video_request_id += 1
+    request_id = video_request_id
+    current_video = None
+    stop_video_playback(clear_frame=False)
+    show_video_placeholder(
+        t(
+            f"Searching online for a {estimate['blades']}-blade propeller video matching {estimate_spec_text(estimate)}...",
+            f"جاري البحث عبر الإنترنت عن فيديو رفاس بعدد {estimate['blades']} شفرات مطابق للمواصفات...",
+        )
+    )
+    set_video_status(t("Searching Wikimedia Commons videos...", "جاري البحث في فيديوهات ويكيميديا كومنز..."))
+    set_video_buttons_state()
 
     def worker():
-        image = (
-            fetch_commons_search_image(search_groups, blade_count, recommendation)
-            or fetch_unsplash_image(search_groups)
-            or load_local_image(fallback_file)
-        )
+        video = fetch_commons_search_video(search_groups, estimate, recommendation)
         try:
-            root.after(0, lambda: finish_image_load(request_id, image))
+            root.after(0, lambda: finish_video_load(request_id, video))
         except tk.TclError:
             pass
 
@@ -613,12 +855,16 @@ def load_image(search_groups, blade_count, recommendation, fallback_file):
 
 
 def clear_outputs():
-    global image_request_id
+    global video_request_id, current_video
 
-    image_request_id += 1
+    video_request_id += 1
+    current_video = None
+    stop_video_playback(clear_frame=False)
     result_label.config(text="", style="Result.TLabel")
     recommendation_label.config(text="")
-    show_image_placeholder(t("Image preview", "معاينة الصورة"))
+    show_video_placeholder(t("Video preview", "معاينة الفيديو"))
+    set_video_status("")
+    set_video_buttons_state()
 
 
 def reset():
@@ -644,7 +890,7 @@ def calculate():
         return
 
     recommendation = recommend_propeller(ship_type, speed_knots, estimate["slip"])
-    search_groups = build_image_queries(ship_type, speed_knots, estimate, recommendation)
+    search_groups = build_video_queries(ship_type, speed_knots, estimate, recommendation)
     efficiency_percent = estimate["efficiency"] * 100
     note = slip_note(estimate["slip"])
 
@@ -667,7 +913,7 @@ def calculate():
         recommendation["en"] if lang == "en" else recommendation["ar"],
     ]
     recommendation_label.config(text="\n".join(recommendation_lines))
-    load_image(search_groups, estimate["blades"], recommendation, recommendation["fallback"])
+    load_video(search_groups, estimate, recommendation)
 
 
 def change_lang(event=None):
@@ -712,8 +958,9 @@ def apply_language_layout():
         ship_label,
         result_label,
         recommendation_label,
-        image_size_label,
-        image_size_value,
+        video_size_label,
+        video_size_value,
+        video_status_label,
     ):
         label.config(anchor=sticky_side, justify=justify)
 
@@ -721,7 +968,7 @@ def apply_language_layout():
     recommendation_label.grid_configure(sticky="ew")
     entry_power.config(justify="right" if is_arabic else "left")
     entry_speed.config(justify="right" if is_arabic else "left")
-    image_label.config(font=app_font(10), justify="center")
+    video_label.config(font=app_font(10), justify="center")
 
 
 def refresh_language():
@@ -741,15 +988,20 @@ def refresh_language():
     reset_button.config(text=t("Reset", "إعادة ضبط"))
     result_frame.config(text=t("Estimate", "التقدير"))
     recommendation_frame.config(text=t("Recommendation", "التوصية"))
-    image_frame.config(text=t("Image", "الصورة"))
-    image_size_label.config(text=t("Image width", "عرض الصورة"))
-    image_size_reset_button.config(text=t("Reset size", "إعادة الحجم"))
+    video_frame.config(text=t("Video", "الفيديو"))
+    video_size_label.config(text=t("Video width", "عرض الفيديو"))
+    video_play_button.config(text=t("Play", "تشغيل"))
+    video_pause_button.config(text=t("Pause", "إيقاف مؤقت"))
+    video_restart_button.config(text=t("Restart", "إعادة تشغيل"))
+    video_open_button.config(text=t("Open Video", "فتح الفيديو"))
+    video_size_reset_button.config(text=t("Reset size", "إعادة الحجم"))
     lang_combo.config(font=app_font(10))
     ship_combo.config(values=ship_display_values(), font=app_font(10))
     set_ship_combo(selected_ship_type)
+    set_video_buttons_state()
 
     if not result_label.cget("text") and not recommendation_label.cget("text"):
-        show_image_placeholder(t("Image preview", "معاينة الصورة"))
+        show_video_placeholder(t("Video preview", "معاينة الفيديو"))
 
 
 def update_scroll_region(event=None):
@@ -764,6 +1016,8 @@ def resize_scroll_frame(event):
         wraplength = max(260, event.width - 96)
         result_label.config(wraplength=wraplength)
         recommendation_label.config(wraplength=wraplength)
+        if "video_status_label" in globals():
+            video_status_label.config(wraplength=wraplength)
 
 
 def on_mousewheel(event):
@@ -775,9 +1029,14 @@ def on_mousewheel(event):
         scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
-def reset_image_size():
-    image_width_var.set(DEFAULT_IMAGE_WIDTH)
-    resize_displayed_image()
+def reset_video_size():
+    video_width_var.set(DEFAULT_VIDEO_WIDTH)
+    resize_video_display()
+
+
+def close_app():
+    stop_video_playback(clear_frame=False)
+    root.destroy()
 
 
 root = tk.Tk()
@@ -789,7 +1048,7 @@ root.columnconfigure(0, weight=1)
 
 LATIN_FONT = choose_font(["Segoe UI", "Noto Sans", "DejaVu Sans", "Arial"])
 ARABIC_FONT = choose_font(["Noto Sans Arabic", "Amiri", "DejaVu Sans", "Arial"])
-image_width_var = tk.DoubleVar(value=DEFAULT_IMAGE_WIDTH)
+video_width_var = tk.DoubleVar(value=DEFAULT_VIDEO_WIDTH)
 
 style = ttk.Style(root)
 try:
@@ -880,56 +1139,93 @@ recommendation_frame.columnconfigure(0, weight=1)
 recommendation_label = ttk.Label(recommendation_frame, text="", wraplength=540, style="Result.TLabel")
 recommendation_label.grid(row=0, column=0, sticky="w")
 
-image_frame = ttk.LabelFrame(main_frame, padding=16, style="Panel.TLabelframe")
-image_frame.grid(row=4, column=0, sticky="ew")
+video_frame = ttk.LabelFrame(main_frame, padding=16, style="Panel.TLabelframe")
+video_frame.grid(row=4, column=0, sticky="ew")
 
-image_control_frame = ttk.Frame(image_frame, style="Panel.TFrame")
-image_control_frame.pack(fill="x", pady=(0, 12))
-image_control_frame.columnconfigure(1, weight=1)
+video_button_frame = ttk.Frame(video_frame, style="Panel.TFrame")
+video_button_frame.pack(fill="x", pady=(0, 10))
+for column in range(4):
+    video_button_frame.columnconfigure(column, weight=1)
 
-image_size_label = ttk.Label(image_control_frame, style="Field.TLabel")
-image_size_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
-
-image_width_slider = ttk.Scale(
-    image_control_frame,
-    from_=MIN_IMAGE_WIDTH,
-    to=MAX_IMAGE_WIDTH,
-    variable=image_width_var,
-    command=resize_displayed_image,
+video_play_button = ttk.Button(
+    video_button_frame,
+    command=play_current_video,
+    style="Accent.TButton",
 )
-image_width_slider.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+video_play_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-image_size_value = ttk.Label(image_control_frame, width=14, style="Field.TLabel")
-image_size_value.grid(row=0, column=2, sticky="e", padx=(0, 10))
-
-image_size_reset_button = ttk.Button(
-    image_control_frame,
-    command=reset_image_size,
+video_pause_button = ttk.Button(
+    video_button_frame,
+    command=pause_current_video,
     style="Plain.TButton",
 )
-image_size_reset_button.grid(row=0, column=3, sticky="e")
+video_pause_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
 
-initial_image_width, initial_image_height = current_image_size()
-image_panel = tk.Frame(
-    image_frame,
-    width=initial_image_width,
-    height=initial_image_height,
+video_restart_button = ttk.Button(
+    video_button_frame,
+    command=restart_current_video,
+    style="Plain.TButton",
+)
+video_restart_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+
+video_open_button = ttk.Button(
+    video_button_frame,
+    command=open_current_video,
+    style="Plain.TButton",
+)
+video_open_button.grid(row=0, column=3, sticky="ew")
+
+video_size_frame = ttk.Frame(video_frame, style="Panel.TFrame")
+video_size_frame.pack(fill="x", pady=(0, 10))
+video_size_frame.columnconfigure(1, weight=1)
+
+video_size_label = ttk.Label(video_size_frame, style="Field.TLabel")
+video_size_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+video_width_slider = ttk.Scale(
+    video_size_frame,
+    from_=MIN_VIDEO_WIDTH,
+    to=MAX_VIDEO_WIDTH,
+    variable=video_width_var,
+    command=resize_video_display,
+)
+video_width_slider.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+video_size_value = ttk.Label(video_size_frame, width=14, style="Field.TLabel")
+video_size_value.grid(row=0, column=2, sticky="e", padx=(0, 10))
+
+video_size_reset_button = ttk.Button(
+    video_size_frame,
+    command=reset_video_size,
+    style="Plain.TButton",
+)
+video_size_reset_button.grid(row=0, column=3, sticky="e")
+
+video_status_label = ttk.Label(video_frame, text="", wraplength=540, style="Field.TLabel")
+video_status_label.pack(fill="x", pady=(0, 10))
+
+initial_video_width, initial_video_height = current_video_size()
+video_panel = tk.Frame(
+    video_frame,
+    width=initial_video_width,
+    height=initial_video_height,
     bg="#f8fafc",
     highlightbackground="#d0d7de",
     highlightthickness=1,
 )
-image_panel.pack(anchor="center")
-image_panel.pack_propagate(False)
+video_panel.pack(anchor="center")
+video_panel.pack_propagate(False)
 
-image_label = tk.Label(
-    image_panel,
+video_label = tk.Label(
+    video_panel,
     bg="#f8fafc",
     fg="#6b7280",
     font=app_font(10),
     justify="center",
     wraplength=400,
 )
-image_label.pack(fill="both", expand=True)
+video_label.pack(fill="both", expand=True)
 
 refresh_language()
+root.protocol("WM_DELETE_WINDOW", close_app)
 root.mainloop()
