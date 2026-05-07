@@ -1,6 +1,6 @@
 import json
 import math
-import random
+import os
 import re
 import shutil
 import subprocess
@@ -30,6 +30,13 @@ COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 COMMONS_VIDEO_SEARCH_LIMIT = 32
 MAX_EXACT_VIDEO_QUERY_ATTEMPTS = 6
 MAX_BROAD_VIDEO_QUERY_ATTEMPTS = 12
+MAX_LLAMA_VIDEO_QUERY_ATTEMPTS = 8
+MAX_VIDEO_CANDIDATES = 18
+LLAMA_VIDEO_SEARCH_ENABLED = os.getenv("LLAMA_VIDEO_SEARCH", "1").strip().lower() not in {"0", "false", "no"}
+LLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+LLAMA_MODEL = os.getenv("OLLAMA_MODEL") or os.getenv("LLAMA_MODEL", "llama3.2:1b")
+LLAMA_MODEL = LLAMA_MODEL.strip()
+LLAMA_TIMEOUT_SECONDS = 8
 HTTP_HEADERS = {
     "User-Agent": "MarinePropellerAdvisor/1.0 (educational tkinter app)",
 }
@@ -251,7 +258,196 @@ def score_video_candidate(candidate, estimate, recommendation):
     if "fan" in searchable_text:
         score -= 25
 
+    if "fahrgeschaft" in searchable_text or "ride" in searchable_text or "amusement" in searchable_text:
+        score -= 60
+
     return score
+
+
+def parse_json_from_text(text):
+    try:
+        return json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    if not text:
+        return None
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def call_llama_json(prompt, timeout=LLAMA_TIMEOUT_SECONDS):
+    if not LLAMA_VIDEO_SEARCH_ENABLED or not LLAMA_MODEL or not LLAMA_HOST:
+        return None
+
+    payload = {
+        "model": LLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.15,
+            "num_predict": 700,
+        },
+    }
+    request = Request(
+        f"{LLAMA_HOST}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            **HTTP_HEADERS,
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            response_data = json.load(response)
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return None
+
+    return parse_json_from_text(response_data.get("response", ""))
+
+
+def sanitize_search_query(query):
+    query = re.sub(r"https?://\S+", "", str(query))
+    query = re.sub(r"[^A-Za-z0-9 .,'()/-]+", " ", query)
+    query = " ".join(query.split()).strip(" .,-/")
+    if len(query) < 4 or len(query) > 120:
+        return ""
+
+    return query
+
+
+def propeller_context(ship_type, speed_knots, estimate, recommendation):
+    return (
+        f"ship type: {SHIP_SEARCH_TERMS.get(ship_type, ship_type)}; "
+        f"recommended propeller: {recommendation['en']}; "
+        f"blades: {estimate['blades']}; "
+        f"diameter: {estimate['diameter']:.2f} m; "
+        f"pitch: {estimate['pitch']:.2f} m; "
+        f"rpm: {estimate['rpm']:.0f}; "
+        f"speed: {speed_knots:.1f} knots; "
+        f"slip: {estimate['slip']:.3f}; "
+        f"efficiency: {estimate['efficiency'] * 100:.1f}%"
+    )
+
+
+def build_llama_video_queries(ship_type, speed_knots, estimate, recommendation):
+    prompt = f"""
+You generate Wikimedia Commons media-search queries for marine propeller videos.
+Use the estimated propeller specs, but avoid impossible over-specific queries.
+Do not return URLs. Do not invent file names.
+Return only JSON with this shape:
+{{"queries":["query 1","query 2","query 3"]}}
+
+Propeller context:
+{propeller_context(ship_type, speed_knots, estimate, recommendation)}
+
+Rules:
+- Prefer marine, ship, vessel, boat, screw propeller, drydock, underwater, cavitation, nozzle, controllable pitch terms when relevant.
+- Include blade count in some queries and omit it in some queries.
+- Include the word video in most queries.
+- Return 5 to 8 short English queries.
+"""
+    response = call_llama_json(prompt)
+    if not isinstance(response, dict):
+        return []
+
+    queries = response.get("queries", [])
+    if not isinstance(queries, list):
+        return []
+
+    return dedupe(
+        query
+        for query in (sanitize_search_query(item) for item in queries)
+        if query
+    )[:MAX_LLAMA_VIDEO_QUERY_ATTEMPTS]
+
+
+def candidate_identity(candidate):
+    return (
+        candidate.get("title", "").strip().lower(),
+        candidate.get("url", "").split("?", 1)[0].strip().lower(),
+    )
+
+
+def sort_video_candidates(candidates):
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            -candidate.get("score", 0),
+            video_title(candidate.get("title", "")).lower(),
+            candidate.get("url", ""),
+        ),
+    )
+
+
+def merge_video_candidates(existing_candidates, new_candidates):
+    seen = {candidate_identity(candidate) for candidate in existing_candidates}
+    for candidate in new_candidates:
+        identity = candidate_identity(candidate)
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        existing_candidates.append(candidate)
+
+    return sort_video_candidates(existing_candidates)[:MAX_VIDEO_CANDIDATES]
+
+
+def choose_video_with_llama(candidates, ship_type, speed_knots, estimate, recommendation):
+    if len(candidates) < 2:
+        return None
+
+    candidate_lines = []
+    for index, candidate in enumerate(candidates[:MAX_VIDEO_CANDIDATES]):
+        candidate_lines.append(
+            f"{index}. title={video_title(candidate.get('title', ''))}; "
+            f"mime={candidate.get('mime', '')}; "
+            f"algorithm_score={candidate.get('score', 0)}"
+        )
+
+    prompt = f"""
+Choose the most accurate marine propeller video candidate for the estimated propeller.
+Only choose from the numbered candidates. Do not invent a URL.
+Return only JSON with this shape:
+{{"best_index":0,"reason":"short reason"}}
+
+Propeller context:
+{propeller_context(ship_type, speed_knots, estimate, recommendation)}
+
+Candidates:
+{chr(10).join(candidate_lines)}
+
+Selection rules:
+- Prefer actual marine/ship/boat propeller footage over aircraft, fans, rides, or generic machinery.
+- Prefer matching propeller type and blade count when the title provides that information.
+- If exact dimensions are unavailable, choose the closest marine propeller context.
+"""
+    response = call_llama_json(prompt)
+    if not isinstance(response, dict):
+        return None
+
+    try:
+        best_index = int(response.get("best_index"))
+    except (TypeError, ValueError):
+        return None
+
+    if 0 <= best_index < min(len(candidates), MAX_VIDEO_CANDIDATES):
+        return {
+            "candidate": candidates[best_index],
+            "reason": str(response.get("reason", "")).strip(),
+        }
+
+    return None
 
 
 def read_positive_number(entry, en_name, ar_name):
@@ -488,6 +684,7 @@ def search_commons_videos(query, estimate, recommendation, require_blade_match):
             "url": video_url,
             "page_url": commons_page_url(page.get("title", "")),
             "mime": mime_type,
+            "query": query,
         }
         if require_blade_match and not has_blade_match(f"{candidate['title']} {candidate['url']}", blade_count):
             continue
@@ -495,26 +692,69 @@ def search_commons_videos(query, estimate, recommendation, require_blade_match):
         candidate["score"] = score_video_candidate(candidate, estimate, recommendation)
         candidates.append(candidate)
 
-    random.shuffle(candidates)
-    candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
-    return candidates
+    return sort_video_candidates(candidates)
 
 
-def fetch_commons_search_video(search_groups, estimate, recommendation):
+def fetch_commons_search_video(search_groups, ship_type, speed_knots, estimate, recommendation, status_callback=None):
+    candidates = []
     exact_queries = list(search_groups["exact"])[:MAX_EXACT_VIDEO_QUERY_ATTEMPTS]
     broad_queries = list(search_groups["broad"])[:MAX_BROAD_VIDEO_QUERY_ATTEMPTS]
 
+    if status_callback:
+        status_callback("Searching exact online video matches...", "جاري البحث عن فيديوهات مطابقة بدقة...")
+
     for query in exact_queries:
-        candidates = search_commons_videos(query, estimate, recommendation, True)
-        if candidates:
-            return candidates[0]
+        candidates = merge_video_candidates(
+            candidates,
+            search_commons_videos(query, estimate, recommendation, True),
+        )
+
+    if status_callback:
+        status_callback("Asking local Llama for extra search queries...", "جاري طلب عبارات بحث إضافية من Llama المحلي...")
+
+    llama_queries = build_llama_video_queries(ship_type, speed_knots, estimate, recommendation)
+    if status_callback:
+        if llama_queries:
+            status_callback("Searching Llama-generated online video queries...", "جاري البحث بعبارات Llama عبر الإنترنت...")
+        else:
+            status_callback("Llama unavailable; continuing with algorithmic search.", "Llama غير متاح؛ جار المتابعة بالبحث الخوارزمي.")
+
+    for query in llama_queries:
+        candidates = merge_video_candidates(
+            candidates,
+            search_commons_videos(query, estimate, recommendation, False),
+        )
+
+    if status_callback:
+        status_callback("Searching broader online video candidates...", "جاري البحث عن فيديوهات أوسع صلة...")
 
     for query in broad_queries:
-        candidates = search_commons_videos(query, estimate, recommendation, False)
-        if candidates:
-            return candidates[0]
+        candidates = merge_video_candidates(
+            candidates,
+            search_commons_videos(query, estimate, recommendation, False),
+        )
 
-    return None
+    if not candidates:
+        return None
+
+    if status_callback:
+        status_callback("Asking local Llama to rank video candidates...", "جاري طلب ترتيب نتائج الفيديو من Llama المحلي...")
+
+    llama_choice = choose_video_with_llama(candidates, ship_type, speed_knots, estimate, recommendation)
+    if llama_choice is not None:
+        return {
+            "video": llama_choice["candidate"],
+            "source": "Llama-ranked online match",
+            "source_ar": "نتيجة من الإنترنت رتبها Llama",
+            "reason": llama_choice["reason"],
+        }
+
+    return {
+        "video": candidates[0],
+        "source": "Algorithm-ranked online match",
+        "source_ar": "نتيجة من الإنترنت رتبتها الخوارزمية",
+        "reason": "",
+    }
 
 
 def current_video_size():
@@ -799,13 +1039,13 @@ def resize_video_display(value=None):
     sync_video_panel_size()
 
 
-def finish_video_load(request_id, video):
+def finish_video_load(request_id, video_result):
     global current_video
 
     if request_id != video_request_id:
         return
 
-    if video is None:
+    if video_result is None:
         current_video = None
         show_video_placeholder(
             t(
@@ -817,18 +1057,22 @@ def finish_video_load(request_id, video):
         set_video_buttons_state()
         return
 
+    video = video_result["video"]
     current_video = video
+    source = video_result.get("source", "Online match") if lang == "en" else video_result.get("source_ar", "نتيجة من الإنترنت")
+    reason = video_result.get("reason", "")
+    reason_text = f" ({reason})" if reason else ""
     set_video_status(
         t(
-            f"Best online match: {video_title(video['title'])}",
-            f"أفضل نتيجة من الإنترنت: {video_title(video['title'])}",
+            f"{source}: {video_title(video['title'])}{reason_text}",
+            f"{source}: {video_title(video['title'])}{reason_text}",
         )
     )
     set_video_buttons_state()
     start_video_playback(video)
 
 
-def load_video(search_groups, estimate, recommendation):
+def load_video(search_groups, ship_type, speed_knots, estimate, recommendation):
     global video_request_id, current_video
 
     video_request_id += 1
@@ -841,13 +1085,26 @@ def load_video(search_groups, estimate, recommendation):
             f"جاري البحث عبر الإنترنت عن فيديو رفاس بعدد {estimate['blades']} شفرات مطابق للمواصفات...",
         )
     )
-    set_video_status(t("Searching Wikimedia Commons videos...", "جاري البحث في فيديوهات ويكيميديا كومنز..."))
+    set_video_status(t("Searching Wikimedia Commons videos with Llama assistance...", "جاري البحث في فيديوهات ويكيميديا كومنز بمساعدة Llama..."))
     set_video_buttons_state()
 
-    def worker():
-        video = fetch_commons_search_video(search_groups, estimate, recommendation)
+    def publish_status(en_message, ar_message):
         try:
-            root.after(0, lambda: finish_video_load(request_id, video))
+            root.after(0, lambda: set_video_status(t(en_message, ar_message)))
+        except tk.TclError:
+            pass
+
+    def worker():
+        video_result = fetch_commons_search_video(
+            search_groups,
+            ship_type,
+            speed_knots,
+            estimate,
+            recommendation,
+            publish_status,
+        )
+        try:
+            root.after(0, lambda: finish_video_load(request_id, video_result))
         except tk.TclError:
             pass
 
@@ -913,7 +1170,7 @@ def calculate():
         recommendation["en"] if lang == "en" else recommendation["ar"],
     ]
     recommendation_label.config(text="\n".join(recommendation_lines))
-    load_video(search_groups, estimate, recommendation)
+    load_video(search_groups, ship_type, speed_knots, estimate, recommendation)
 
 
 def change_lang(event=None):
