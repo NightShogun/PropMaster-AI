@@ -1,18 +1,38 @@
-import json
-import math
-import os
-import re
 import shutil
 import subprocess
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk
 import webbrowser
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from tkinter import ttk
+
+from constants import (
+    ACCENT,
+    ACCENT_DARK,
+    APP_BG,
+    BORDER,
+    DANGER,
+    DEFAULT_VIDEO_WIDTH,
+    HTTP_HEADERS,
+    MAX_VIDEO_WIDTH,
+    MIN_VIDEO_WIDTH,
+    MUTED_TEXT,
+    SECONDARY,
+    SECONDARY_DARK,
+    SHIP_RPM_FACTORS,
+    SHIP_TYPES,
+    SURFACE,
+    SURFACE_SOFT,
+    TEXT,
+    VIDEO_ASPECT_RATIO,
+    VIDEO_FPS,
+    VIDEO_SURFACE,
+)
+from i18n import translate
+from propeller import estimate_propeller, recommend_propeller, slip_note
+from ships import ship_display_name, ship_display_values, ship_type_from_display
+from video_search import build_video_queries, estimate_spec_text, fetch_archive_search_video, video_title
 
 try:
     from PIL import Image, ImageTk
@@ -20,1713 +40,867 @@ except ImportError as exc:
     raise SystemExit("Install Pillow first: pip install pillow") from exc
 
 
-DEFAULT_VIDEO_WIDTH = 600
-DEFAULT_VIDEO_HEIGHT = 338
-VIDEO_ASPECT_RATIO = DEFAULT_VIDEO_HEIGHT / DEFAULT_VIDEO_WIDTH
-MIN_VIDEO_WIDTH = 360
-MAX_VIDEO_WIDTH = 760
-VIDEO_FPS = 24
-ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php"
-ARCHIVE_METADATA_URL = "https://archive.org/metadata"
-ARCHIVE_VIDEO_SEARCH_LIMIT = 12
-ARCHIVE_ITEMS_PER_QUERY = 4
-ARCHIVE_VIDEO_EXTENSIONS = (".mp4", ".m4v", ".webm", ".ogv", ".mov")
-ARCHIVE_VIDEO_FORMAT_TERMS = ("mpeg4", "h.264", "webm", "matroska", "ogv", "quicktime", "movie")
-MAX_EXACT_VIDEO_QUERY_ATTEMPTS = 6
-MAX_BROAD_VIDEO_QUERY_ATTEMPTS = 12
-MAX_LLAMA_VIDEO_QUERY_ATTEMPTS = 8
-MAX_VIDEO_CANDIDATES = 18
-LLAMA_VIDEO_SEARCH_ENABLED = os.getenv("LLAMA_VIDEO_SEARCH", "1").strip().lower() not in {"0", "false", "no"}
-LLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-LLAMA_MODEL = os.getenv("OLLAMA_MODEL") or os.getenv("LLAMA_MODEL", "llama3.2:1b")
-LLAMA_MODEL = LLAMA_MODEL.strip()
-LLAMA_TIMEOUT_SECONDS = 8
-HTTP_HEADERS = {
-    "User-Agent": "MarinePropellerAdvisor/1.0 (educational tkinter app)",
-}
-
-APP_BG = "#eef4f8"
-SURFACE = "#ffffff"
-SURFACE_SOFT = "#f8fafc"
-VIDEO_SURFACE = "#0f172a"
-BORDER = "#d8e0e8"
-TEXT = "#111827"
-MUTED_TEXT = "#5f6b7a"
-ACCENT = "#0f766e"
-ACCENT_DARK = "#115e59"
-SECONDARY = "#2563eb"
-SECONDARY_DARK = "#1d4ed8"
-DANGER = "#b42318"
-
-SHIP_TYPES = (
-    "cargo",
-    "tanker",
-    "container",
-    "passenger",
-    "yacht",
-    "tug",
-    "fishing",
-    "naval",
-)
-
-SHIP_LABELS = {
-    "cargo": {"en": "Cargo", "ar": "سفينة بضائع"},
-    "tanker": {"en": "Tanker", "ar": "ناقلة"},
-    "container": {"en": "Container Ship", "ar": "سفينة حاويات"},
-    "passenger": {"en": "Passenger Ship", "ar": "سفينة ركاب"},
-    "yacht": {"en": "Yacht", "ar": "يخت"},
-    "tug": {"en": "Tugboat", "ar": "قاطرة بحرية"},
-    "fishing": {"en": "Fishing Vessel", "ar": "سفينة صيد"},
-    "naval": {"en": "Naval Ship", "ar": "سفينة بحرية"},
-}
-
-SHIP_SEARCH_TERMS = {
-    "cargo": "cargo ship",
-    "tanker": "oil tanker",
-    "container": "container ship",
-    "passenger": "passenger ship",
-    "yacht": "yacht",
-    "tug": "tugboat",
-    "fishing": "fishing vessel",
-    "naval": "naval ship",
-}
-
-SHIP_RPM_FACTORS = {
-    "cargo": 25,
-    "tanker": 25,
-    "container": 35,
-    "passenger": 35,
-    "yacht": 50,
-    "tug": 30,
-    "fishing": 28,
-    "naval": 32,
-}
-
-HIGH_BLADE_TYPES = {"cargo", "tanker", "container"}
-BLADE_WORDS = {
-    4: "four",
-    5: "five",
-}
-
-lang = "en"
-video_request_id = 0
-video_session_id = 0
-current_video = None
-video_process = None
-video_playing = False
-video_paused = False
-video_frame_seen = False
-
-
-def t(en, ar):
-    return en if lang == "en" else ar
-
-
-def choose_font(preferred_names, fallback="TkDefaultFont"):
-    available_fonts = {font.lower(): font for font in tkfont.families(root)}
-    for name in preferred_names:
-        if name.lower() in available_fonts:
-            return available_fonts[name.lower()]
-
-    return fallback
-
-
-def app_font(size, weight=None):
-    family = ARABIC_FONT if lang == "ar" else LATIN_FONT
-    return (family, size, weight) if weight else (family, size)
-
-
-def ship_display_name(ship_type):
-    labels = SHIP_LABELS.get(ship_type, {"en": ship_type.title(), "ar": ship_type})
-    return labels["en"] if lang == "en" else labels["ar"]
-
-
-def ship_display_values():
-    return [ship_display_name(ship_type) for ship_type in SHIP_TYPES]
-
-
-def get_selected_ship_type():
-    selected_value = ship_combo.get().strip()
-    normalized_value = selected_value.lower()
-
-    for ship_type in SHIP_TYPES:
-        labels = SHIP_LABELS[ship_type]
-        if normalized_value == ship_type or selected_value in labels.values():
-            return ship_type
-
-    return ""
-
-
-def set_ship_combo(ship_type):
-    ship_combo.set(ship_display_name(ship_type))
-
-
-def metric_line(en_label, ar_label, value):
-    return f"{t(en_label, ar_label)}: {value}"
-
-
-def dedupe(items):
-    seen = set()
-    unique_items = []
-
-    for item in items:
-        normalized_item = " ".join(item.split()).lower()
-        if normalized_item in seen:
-            continue
-
-        seen.add(normalized_item)
-        unique_items.append(item)
-
-    return unique_items
-
-
-def normalized_search_text(text):
-    return re.sub(r"[^a-z0-9]+", " ", text.lower())
-
-
-def blade_phrases(blade_count):
-    word = BLADE_WORDS.get(blade_count, str(blade_count))
-    number = str(blade_count)
-    return [
-        f"{number} blade",
-        f"{number} bladed",
-        f"{word} blade",
-        f"{word} bladed",
-    ]
-
-
-def has_blade_match(text, blade_count):
-    normalized_text = normalized_search_text(text)
-    return any(phrase in normalized_text for phrase in blade_phrases(blade_count))
-
-
-def video_title(title):
-    cleaned_title = title.replace("File:", "", 1).replace("_", " ").strip()
-    return cleaned_title or t("Online propeller video", "فيديو رفاس من الإنترنت")
-
-
-def archive_details_url(identifier):
-    if not identifier:
-        return ""
-
-    return "https://archive.org/details/" + quote(identifier, safe="")
-
-
-def archive_download_url(identifier, file_name):
-    if not identifier or not file_name:
-        return ""
-
-    return f"https://archive.org/download/{quote(identifier, safe='')}/{quote(file_name, safe='/')}"
-
-
-def estimate_spec_text(estimate):
-    return (
-        f"{estimate['blades']}-blade, "
-        f"{estimate['diameter']:.2f} m diameter, "
-        f"{estimate['pitch']:.2f} m pitch, "
-        f"{estimate['rpm']:.0f} RPM"
-    )
-
-
-def number_tokens(value):
-    return {
-        f"{value:.2f}",
-        f"{value:.1f}",
-        str(round(value)),
-    }
-
-
-def score_video_candidate(candidate, estimate, recommendation):
-    searchable_fields = [
-        candidate.get("title", ""),
-        candidate.get("description", ""),
-        candidate.get("subject", ""),
-        candidate.get("identifier", ""),
-        candidate.get("file_name", ""),
-        candidate.get("query", ""),
-        candidate.get("url", ""),
-    ]
-    raw_text = " ".join(str(field) for field in searchable_fields).lower()
-    searchable_text = normalized_search_text(raw_text)
-    score = 0
-    blade_count = estimate["blades"]
-
-    if has_blade_match(searchable_text, blade_count):
-        score += 120
-
-    if "propeller" in searchable_text or "screw" in searchable_text:
-        score += 50
-
-    if "ship" in searchable_text or "marine" in searchable_text or "vessel" in searchable_text:
-        score += 35
-
-    if "boat" in searchable_text or "drydock" in searchable_text or "underwater" in searchable_text:
-        score += 18
-
-    if "rudder" in searchable_text or "propulsion" in searchable_text or "cavitation" in searchable_text:
-        score += 15
-
-    if "video" in searchable_text:
-        score += 10
-
-    if recommendation["kind"] == "controllable" and "controllable" in searchable_text:
-        score += 35
-    elif recommendation["kind"] == "ducted" and (
-        "ducted" in searchable_text or "kort" in searchable_text or "nozzle" in searchable_text
-    ):
-        score += 35
-    elif recommendation["kind"] == "fixed" and ("fixed" in searchable_text or "screw" in searchable_text):
-        score += 20
-
-    for token in number_tokens(estimate["rpm"]):
-        if token in raw_text:
-            score += 15
-            break
-
-    for dimension in ("diameter", "pitch"):
-        for token in number_tokens(estimate[dimension]):
-            if token in raw_text or f"{token}m" in raw_text:
-                score += 15
-                break
-
-    if "aircraft" in searchable_text or "aeroplane" in searchable_text or "airplane" in searchable_text:
-        score -= 80
-
-    if "fan" in searchable_text:
-        score -= 25
-
-    if "fahrgeschaft" in searchable_text or "ride" in searchable_text or "amusement" in searchable_text:
-        score -= 60
-
-    if "toy" in searchable_text or "lego" in searchable_text or "game" in searchable_text:
-        score -= 45
-
-    return score
-
-
-def parse_json_from_text(text):
-    try:
-        return json.loads(text)
-    except (TypeError, json.JSONDecodeError):
-        pass
-
-    if not text:
-        return None
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-
-    try:
-        return json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-
-
-def call_llama_json(prompt, timeout=LLAMA_TIMEOUT_SECONDS):
-    if not LLAMA_VIDEO_SEARCH_ENABLED or not LLAMA_MODEL or not LLAMA_HOST:
-        return None
-
-    payload = {
-        "model": LLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": 0.15,
-            "num_predict": 700,
-        },
-    }
-    request = Request(
-        f"{LLAMA_HOST}/api/generate",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            **HTTP_HEADERS,
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            response_data = json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-        return None
-
-    return parse_json_from_text(response_data.get("response", ""))
-
-
-def sanitize_search_query(query):
-    query = re.sub(r"https?://\S+", "", str(query))
-    query = re.sub(r"[^A-Za-z0-9 .,'()/-]+", " ", query)
-    query = " ".join(query.split()).strip(" .,-/")
-    if len(query) < 4 or len(query) > 120:
-        return ""
-
-    return query
-
-
-def propeller_context(ship_type, speed_knots, estimate, recommendation):
-    return (
-        f"ship type: {SHIP_SEARCH_TERMS.get(ship_type, ship_type)}; "
-        f"recommended propeller: {recommendation['en']}; "
-        f"blades: {estimate['blades']}; "
-        f"diameter: {estimate['diameter']:.2f} m; "
-        f"pitch: {estimate['pitch']:.2f} m; "
-        f"rpm: {estimate['rpm']:.0f}; "
-        f"speed: {speed_knots:.1f} knots; "
-        f"slip: {estimate['slip']:.3f}; "
-        f"efficiency: {estimate['efficiency'] * 100:.1f}%"
-    )
-
-
-def build_llama_video_queries(ship_type, speed_knots, estimate, recommendation):
-    prompt = f"""
-You generate public video archive search queries for marine propeller videos.
-Use the estimated propeller specs, but avoid impossible over-specific queries.
-Do not return URLs. Do not invent file names.
-Return only JSON with this shape:
-{{"queries":["query 1","query 2","query 3"]}}
-
-Propeller context:
-{propeller_context(ship_type, speed_knots, estimate, recommendation)}
-
-Rules:
-- Prefer marine, ship, vessel, boat, screw propeller, drydock, underwater, cavitation, nozzle, controllable pitch terms when relevant.
-- Write queries that can find Internet Archive video records.
-- Include blade count in some queries and omit it in some queries.
-- Include the word video in most queries.
-- Return 5 to 8 short English queries.1
-"""
-    response = call_llama_json(prompt)
-    if not isinstance(response, dict):
-        return []
-
-    queries = response.get("queries", [])
-    if not isinstance(queries, list):
-        return []
-
-    return dedupe(
-        query
-        for query in (sanitize_search_query(item) for item in queries)
-        if query
-    )[:MAX_LLAMA_VIDEO_QUERY_ATTEMPTS]
-
-
-def candidate_identity(candidate):
-    return (
-        candidate.get("title", "").strip().lower(),
-        candidate.get("url", "").split("?", 1)[0].strip().lower(),
-    )
-
-
-def sort_video_candidates(candidates):
-    return sorted(
-        candidates,
-        key=lambda candidate: (
-            -candidate.get("score", 0),
-            video_title(candidate.get("title", "")).lower(),
-            candidate.get("url", ""),
-        ),
-    )
-
-
-def merge_video_candidates(existing_candidates, new_candidates):
-    seen = {candidate_identity(candidate) for candidate in existing_candidates}
-    for candidate in new_candidates:
-        identity = candidate_identity(candidate)
-        if identity in seen:
-            continue
-
-        seen.add(identity)
-        existing_candidates.append(candidate)
-
-    return sort_video_candidates(existing_candidates)[:MAX_VIDEO_CANDIDATES]
-
-
-def choose_video_with_llama(candidates, ship_type, speed_knots, estimate, recommendation):
-    if len(candidates) < 2:
-        return None
-
-    candidate_lines = []
-    for index, candidate in enumerate(candidates[:MAX_VIDEO_CANDIDATES]):
-        candidate_lines.append(
-            f"{index}. title={video_title(candidate.get('title', ''))}; "
-            f"mime={candidate.get('mime', '')}; "
-            f"algorithm_score={candidate.get('score', 0)}"
-        )
-
-    prompt = f"""
-Choose the most accurate marine propeller video candidate for the estimated propeller.
-Only choose from the numbered candidates. Do not invent a URL.
-Return only JSON with this shape:
-{{"best_index":0,"reason":"short reason"}}
-
-Propeller context:
-{propeller_context(ship_type, speed_knots, estimate, recommendation)}
-
-Candidates:
-{chr(10).join(candidate_lines)}
-
-Selection rules:
-- Prefer actual marine/ship/boat propeller footage over aircraft, fans, rides, or generic machinery.
-- Prefer matching propeller type and blade count when the title provides that information.
-- If exact dimensions are unavailable, choose the closest marine propeller context.
-"""
-    response = call_llama_json(prompt)
-    if not isinstance(response, dict):
-        return None
-
-    try:
-        best_index = int(response.get("best_index"))
-    except (TypeError, ValueError):
-        return None
-
-    if 0 <= best_index < min(len(candidates), MAX_VIDEO_CANDIDATES):
-        return {
-            "candidate": candidates[best_index],
-            "reason": str(response.get("reason", "")).strip(),
-        }
-
-    return None
-
-
-def read_positive_number(entry, en_name, ar_name):
-    raw_value = entry.get().strip()
-
-    try:
-        value = float(raw_value)
-    except ValueError as exc:
-        raise ValueError(t(f"{en_name} must be a number.", f"{ar_name} يجب أن يكون رقمًا.")) from exc
-
-    if value <= 0:
-        raise ValueError(
-            t(
-                f"{en_name} must be greater than zero.",
-                f"{ar_name} يجب أن يكون أكبر من صفر.",
-            )
-        )
-
-    return value
-
-
-def estimate_propeller(power_kw, speed_knots, ship_type):
-    rpm = SHIP_RPM_FACTORS[ship_type] * math.sqrt(power_kw)
-    speed_ms = speed_knots * 0.5144
-
-    diameter = (power_kw / (rpm * 3)) * 2
-    pitch_ratio = 0.6 if speed_knots < 12 else 0.8 if speed_knots < 20 else 1.0
-    pitch = diameter * pitch_ratio
-
-    revolutions_per_second = rpm / 60
-    theoretical_advance = revolutions_per_second * pitch
-    if theoretical_advance <= 0:
-        raise ValueError(t("Unable to calculate slip from these inputs.", "لا يمكن حساب الانزلاق بهذه القيم."))
-
-    slip = (theoretical_advance - speed_ms) / theoretical_advance
-    blades = 5 if ship_type in HIGH_BLADE_TYPES else 4
-    efficiency = max(0.0, min(1.0 - abs(slip) * 0.7, 1.0))
-
-    return {
-        "rpm": rpm,
-        "diameter": diameter,
-        "pitch": pitch,
-        "slip": slip,
-        "blades": blades,
-        "efficiency": efficiency,
-    }
-
-
-def recommend_propeller(ship_type, speed_knots, slip):
-    if speed_knots > 25:
-        return {
-            "kind": "controllable",
-            "en": "Controllable Pitch Propeller",
-            "ar": "رفاس متغير الزاوية",
-            "query": "controllable pitch propeller",
-            "fallback": "propeller.jpg",
-        }
-
-    if slip > 0.5:
-        return {
-            "kind": "ducted",
-            "en": "Ducted Propeller",
-            "ar": "رفاس داخل قناة",
-            "query": "ducted propeller",
-            "fallback": "ducted.jpg",
-        }
-
-    return {
-        "kind": "fixed",
-        "en": "Fixed Pitch Propeller",
-        "ar": "رفاس ثابت",
-        "query": "fixed pitch propeller",
-        "fallback": "cargo.jpg",
-    }
-
-
-def slip_note(slip):
-    if slip < 0:
-        return t(
-            "Note: negative slip usually means the speed is too high for this rough estimate.",
-            "ملاحظة: الانزلاق السالب يعني غالبًا أن السرعة عالية جدًا لهذا التقدير التقريبي.",
-        )
-
-    if slip > 0.6:
-        return t(
-            "Note: high slip suggests a low-speed thrust setup may be more suitable.",
-            "ملاحظة: الانزلاق العالي يشير إلى أن إعداد دفع للسرعات المنخفضة قد يكون أنسب.",
-        )
-
-    return ""
-
-
-def build_video_queries(ship_type, speed_knots, estimate, recommendation):
-    ship_term = SHIP_SEARCH_TERMS.get(ship_type, f"{ship_type} ship")
-    blade_count = estimate["blades"]
-    efficiency_percent = estimate["efficiency"] * 100
-    slip = estimate["slip"]
-    blade_word = BLADE_WORDS.get(blade_count, str(blade_count))
-    diameter = estimate["diameter"]
-    pitch = estimate["pitch"]
-    rpm = estimate["rpm"]
-
-    exact_spec_queries = [
-        f"{blade_count} blade {recommendation['query']} {diameter:.2f} m diameter {pitch:.2f} m pitch {rpm:.0f} rpm video",
-        f"{blade_word} blade {recommendation['query']} {ship_term} propeller video",
-        f"{blade_count} blade marine propeller {ship_term} video",
-        f"{blade_count} blade marine propeller {ship_term}",
-        f"{blade_word}-bladed ship propeller video",
-        f"{blade_count}-blade {recommendation['query']} video",
-    ]
-
-    broad_queries = [
-        f"{recommendation['query']} {ship_term} video",
-        f"{blade_word} blade propeller video",
-        f"{blade_count} blade propeller video",
-        f"{ship_term} propeller video",
-        f"{ship_term} {recommendation['en']} video",
-        f"{speed_knots:.0f} knot {ship_term} propeller video",
-        f"{recommendation['query']} video",
-        "marine propeller video",
-        "ship propeller video",
-        "boat propeller video",
-        "propeller video",
-        "video of propeller",
-        f"{recommendation['query']} {ship_term}",
-        f"{ship_term} propeller",
-        recommendation["query"],
-        "marine propeller",
-        "ship propeller",
-    ]
-
-    if recommendation["kind"] == "controllable":
-        exact_spec_queries.extend(
-            [
-                f"{blade_word} blade controllable pitch propeller video",
-                f"{blade_count} blade controllable pitch propeller video",
-            ]
-        )
-        broad_queries.extend(
-            [
-                f"high speed marine propeller {ship_term} video",
-                "high speed marine propeller video",
-                "controllable pitch propeller ship video",
-            ]
-        )
-    elif recommendation["kind"] == "ducted":
-        exact_spec_queries.extend(
-            [
-                f"{blade_word} blade ducted propeller video",
-                f"{blade_count} blade ducted propeller video",
-            ]
-        )
-        broad_queries.extend(
-            [
-                f"Kort nozzle propeller {ship_term} video",
-                f"ducted propeller {ship_term} video",
-                "Kort nozzle propeller video",
-                "tugboat ducted propeller video",
-            ]
-        )
-    else:
-        exact_spec_queries.extend(
-            [
-                f"{blade_word} blade fixed pitch propeller video",
-                f"{blade_count} blade fixed pitch propeller video",
-            ]
-        )
-        broad_queries.extend(
-            [
-                f"fixed pitch propeller {ship_term} video",
-                f"ship propeller drydock {ship_term} video",
-                "ship propeller drydock video",
-                "marine screw propeller ship video",
-            ]
-        )
-
-    if slip < 0:
-        broad_queries.append(f"high speed ship propeller {ship_term} video")
-    elif slip > 0.6:
-        broad_queries.append(f"low speed thrust propeller {ship_term} video")
-
-    if efficiency_percent < 65:
-        broad_queries.append(f"marine propeller cavitation {ship_term} video")
-
-    return {
-        "exact": dedupe(exact_spec_queries),
-        "broad": dedupe(broad_queries),
-    }
-
-
-def clean_metadata_text(value):
-    if isinstance(value, (list, tuple, set)):
-        return " ".join(clean_metadata_text(item) for item in value)
-
-    if isinstance(value, dict):
-        return " ".join(clean_metadata_text(item) for item in value.values())
-
-    text = re.sub(r"<[^>]+>", " ", str(value or ""))
-    return " ".join(text.split())
-
-
-def archive_file_is_video(file_info):
-    name = file_info.get("name", "").lower()
-    file_format = file_info.get("format", "").lower()
-    return name.endswith(ARCHIVE_VIDEO_EXTENSIONS) or any(
-        term in file_format for term in ARCHIVE_VIDEO_FORMAT_TERMS
-    )
-
-
-def archive_file_mime(file_name):
-    name = file_name.lower()
-    if name.endswith((".mp4", ".m4v", ".mov")):
-        return "video/mp4"
-    if name.endswith(".webm"):
-        return "video/webm"
-    if name.endswith(".ogv"):
-        return "video/ogg"
-
-    return "video/*"
-
-
-def archive_video_file_score(file_info):
-    name = file_info.get("name", "").lower()
-    file_format = file_info.get("format", "").lower()
-    score = 0
-
-    if name.endswith((".mp4", ".m4v")):
-        score += 50
-    elif name.endswith(".webm"):
-        score += 42
-    elif name.endswith(".ogv"):
-        score += 30
-    elif name.endswith(".mov"):
-        score += 20
-
-    if "h.264" in file_format or "mpeg4" in file_format:
-        score += 20
-    if "derivative" in file_info.get("source", "").lower():
-        score += 6
-
-    try:
-        size = int(file_info.get("size", 0))
-    except (TypeError, ValueError):
-        size = 0
-    if size > 2_000_000:
-        score += 8
-
-    return score
-
-
-def best_archive_video_file(files):
-    video_files = [file_info for file_info in files if archive_file_is_video(file_info)]
-    if not video_files:
-        return None
-
-    video_files.sort(key=archive_video_file_score, reverse=True)
-    return video_files[0]
-
-
-def fetch_archive_metadata(identifier):
-    if not identifier:
-        return None
-
-    try:
-        request = Request(f"{ARCHIVE_METADATA_URL}/{quote(identifier, safe='')}", headers=HTTP_HEADERS)
-        with urlopen(request, timeout=8) as response:
-            return json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-        return None
-
-
-def search_archive_items(query):
-    clean_query = sanitize_search_query(query)
-    if not clean_query:
-        return []
-
-    params = urlencode(
-        [
-            ("q", f"({clean_query}) AND mediatype:(movies)"),
-            ("fl[]", "identifier"),
-            ("fl[]", "title"),
-            ("fl[]", "description"),
-            ("fl[]", "subject"),
-            ("rows", str(ARCHIVE_VIDEO_SEARCH_LIMIT)),
-            ("page", "1"),
-            ("output", "json"),
-        ]
-    )
-
-    try:
-        request = Request(f"{ARCHIVE_SEARCH_URL}?{params}", headers=HTTP_HEADERS)
-        with urlopen(request, timeout=8) as response:
-            data = json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-        return []
-
-    return data.get("response", {}).get("docs", [])
-
-
-def search_archive_videos(query, estimate, recommendation, require_blade_match):
-    candidates = []
-    blade_count = estimate["blades"]
-
-    for item in search_archive_items(query)[:ARCHIVE_ITEMS_PER_QUERY]:
-        identifier = item.get("identifier", "")
-        metadata = fetch_archive_metadata(identifier)
-        if not metadata:
-            continue
-
-        file_info = best_archive_video_file(metadata.get("files", []))
-        if not file_info:
-            continue
-
-        item_metadata = metadata.get("metadata", {})
-        title = clean_metadata_text(item_metadata.get("title") or item.get("title") or identifier)
-        description = clean_metadata_text(item_metadata.get("description") or item.get("description", ""))
-        subject = clean_metadata_text(item_metadata.get("subject") or item.get("subject", ""))
-        file_name = file_info.get("name", "")
-        video_url = archive_download_url(identifier, file_name)
-        if not video_url:
-            continue
-
-        candidate = {
-            "title": title,
-            "description": description,
-            "subject": subject,
-            "identifier": identifier,
-            "file_name": file_name,
-            "url": video_url,
-            "page_url": archive_details_url(identifier),
-            "mime": archive_file_mime(file_name),
-            "query": query,
-            "provider": "Internet Archive",
-        }
-        if require_blade_match and not has_blade_match(
-            f"{candidate['title']} {candidate['description']} {candidate['subject']} {candidate['file_name']}",
-            blade_count,
-        ):
-            continue
-
-        candidate["score"] = score_video_candidate(candidate, estimate, recommendation)
-        candidates.append(candidate)
-
-    return sort_video_candidates(candidates)
-
-
-def fetch_archive_search_video(search_groups, ship_type, speed_knots, estimate, recommendation, status_callback=None):
-    candidates = []
-    exact_queries = list(search_groups["exact"])[:MAX_EXACT_VIDEO_QUERY_ATTEMPTS]
-    broad_queries = list(search_groups["broad"])[:MAX_BROAD_VIDEO_QUERY_ATTEMPTS]
-
-    if status_callback:
-        status_callback("Searching exact public video archive matches...", "جاري البحث عن فيديوهات أرشيفية مطابقة بدقة...")
-
-    for query in exact_queries:
-        candidates = merge_video_candidates(
-            candidates,
-            search_archive_videos(query, estimate, recommendation, True),
-        )
-
-    if status_callback:
-        status_callback("Asking local Llama for extra search queries...", "جاري طلب عبارات بحث إضافية من Llama المحلي...")
-
-    llama_queries = build_llama_video_queries(ship_type, speed_knots, estimate, recommendation)
-    if status_callback:
-        if llama_queries:
-            status_callback("Searching Llama-generated online video queries...", "جاري البحث بعبارات Llama عبر الإنترنت...")
-        else:
-            status_callback("Llama unavailable; continuing with algorithmic search.", "Llama غير متاح؛ جار المتابعة بالبحث الخوارزمي.")
-
-    for query in llama_queries:
-        candidates = merge_video_candidates(
-            candidates,
-            search_archive_videos(query, estimate, recommendation, False),
-        )
-
-    if status_callback:
-        status_callback("Searching broader public video archive candidates...", "جاري البحث عن فيديوهات أرشيفية أوسع صلة...")
-
-    for query in broad_queries:
-        candidates = merge_video_candidates(
-            candidates,
-            search_archive_videos(query, estimate, recommendation, False),
-        )
-
-    if not candidates:
-        return None
-
-    if status_callback:
-        status_callback("Asking local Llama to rank video candidates...", "جاري طلب ترتيب نتائج الفيديو من Llama المحلي...")
-
-    llama_choice = choose_video_with_llama(candidates, ship_type, speed_knots, estimate, recommendation)
-    if llama_choice is not None:
-        return {
-            "video": llama_choice["candidate"],
-            "source": "Llama-ranked archive video",
-            "source_ar": "فيديو أرشيفي رتبه Llama",
-            "reason": llama_choice["reason"],
-        }
-
-    return {
-        "video": candidates[0],
-        "source": "Algorithm-ranked archive video",
-        "source_ar": "فيديو أرشيفي رتبته الخوارزمية",
-        "reason": "",
-    }
-
-
-def current_video_size():
-    width = round(float(video_width_var.get()))
-    height = max(150, round(width * VIDEO_ASPECT_RATIO))
-    return width, height
-
-
-def sync_video_panel_size():
-    if "video_panel" not in globals():
-        return
-
-    width, height = current_video_size()
-    video_panel.config(width=width, height=height)
-    video_label.config(wraplength=max(160, width - 36))
-    if "video_size_value" in globals():
-        video_size_value.config(text=f"{width} x {height} px")
-
-
-def set_video_status(message):
-    if "video_status_label" in globals():
-        video_status_label.config(text=message)
-
-
-def set_video_buttons_state():
-    if "video_play_button" not in globals():
-        return
-
-    has_video = current_video is not None
-    video_play_button.config(state=tk.NORMAL if has_video and (not video_playing or video_paused) else tk.DISABLED)
-    video_pause_button.config(state=tk.NORMAL if has_video and video_playing and not video_paused else tk.DISABLED)
-    video_restart_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
-    video_open_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
-
-
-def show_video_placeholder(message):
-    sync_video_panel_size()
-    video_label.config(image="", text=message)
-    video_label.image = None
-
-
-def display_video_frame(session_id, frame):
-    global video_frame_seen
-
-    if session_id != video_session_id:
-        return
-
-    video_frame_seen = True
-    photo = ImageTk.PhotoImage(frame)
-    video_label.config(image=photo, text="")
-    video_label.image = photo
-
-
-def read_video_frame(stdout, frame_size):
-    chunks = []
-    remaining = frame_size
-
-    while remaining > 0:
-        chunk = stdout.read(remaining)
-        if not chunk:
-            return None
-        chunks.append(chunk)
-        remaining -= len(chunk)
-
-    return b"".join(chunks)
-
-
-def build_ffmpeg_command(video_url, width, height):
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        return None
-
-    scale_filter = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,"
-        f"fps={VIDEO_FPS}"
-    )
-    return [
-        ffmpeg_path,
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-user_agent",
-        HTTP_HEADERS["User-Agent"],
-        "-reconnect",
-        "1",
-        "-reconnect_streamed",
-        "1",
-        "-reconnect_delay_max",
-        "4",
-        "-i",
-        video_url,
-        "-an",
-        "-vf",
-        scale_filter,
-        "-pix_fmt",
-        "rgb24",
-        "-f",
-        "rawvideo",
-        "pipe:1",
-    ]
-
-
-def video_reader(session_id, process, width, height):
-    frame_size = width * height * 3
-    frame_delay = 1 / VIDEO_FPS
-    next_frame_time = time.monotonic()
-
-    try:
-        while session_id == video_session_id:
-            while video_paused and session_id == video_session_id:
-                time.sleep(0.05)
-
-            frame_data = read_video_frame(process.stdout, frame_size)
-            if frame_data is None:
-                break
-
-            frame = Image.frombytes("RGB", (width, height), frame_data)
-            try:
-                root.after(0, lambda sid=session_id, image=frame: display_video_frame(sid, image))
-            except tk.TclError:
-                break
-
-            next_frame_time += frame_delay
-            delay = next_frame_time - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_frame_time = time.monotonic()
-    finally:
+class MarinePropellerAdvisorApp:
+    """Tkinter shell for the propeller advisor workflow."""
+
+    def __init__(self):
+        self.lang = "en"
+        self.video_request_id = 0
+        self.video_session_id = 0
+        self.current_video = None
+        self.video_process = None
+        self.video_playing = False
+        self.video_paused = False
+        self.video_frame_seen = False
+
+        self.root = tk.Tk()
+        self.root.geometry("1120x760")
+        self.root.minsize(920, 620)
+        self.root.configure(bg=APP_BG)
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+
+        self.latin_font = self.choose_font(["Segoe UI", "Noto Sans", "DejaVu Sans", "Arial"])
+        self.arabic_font = self.choose_font(["Noto Sans Arabic", "Amiri", "DejaVu Sans", "Arial"])
+        self.video_width_var = tk.DoubleVar(self.root, value=DEFAULT_VIDEO_WIDTH)
+
+        self.style = ttk.Style(self.root)
         try:
-            process.wait(timeout=0.2)
-        except subprocess.TimeoutExpired:
-            pass
-
-        try:
-            root.after(0, lambda sid=session_id: finish_video_playback(sid))
+            self.style.theme_use("clam")
         except tk.TclError:
             pass
 
+        self.configure_styles()
+        self.build_layout()
+        self.refresh_language()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
-def terminate_video_process(process):
-    if process is None or process.poll() is not None:
-        return
+    def tr(self, en_text, ar_text):
+        return translate(self.lang, en_text, ar_text)
 
-    process.terminate()
-    try:
-        process.wait(timeout=0.6)
-    except subprocess.TimeoutExpired:
-        process.kill()
+    def choose_font(self, preferred_names, fallback="TkDefaultFont"):
+        available_fonts = {font.lower(): font for font in tkfont.families(self.root)}
+        for name in preferred_names:
+            if name.lower() in available_fonts:
+                return available_fonts[name.lower()]
+
+        return fallback
+
+    def app_font(self, size, weight=None):
+        family = self.arabic_font if self.lang == "ar" else self.latin_font
+        return (family, size, weight) if weight else (family, size)
+
+    def get_selected_ship_type(self):
+        return ship_type_from_display(self.ship_combo.get())
+
+    def set_ship_combo(self, ship_type):
+        self.ship_combo.set(ship_display_name(ship_type, self.lang))
+
+    def metric_line(self, en_label, ar_label, value):
+        return f"{self.tr(en_label, ar_label)}: {value}"
+
+    def read_positive_number(self, entry, en_name, ar_name):
+        raw_value = entry.get().strip()
+
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise ValueError(self.tr(f"{en_name} must be a number.", f"{ar_name} يجب أن يكون رقمًا.")) from exc
+
+        if value <= 0:
+            raise ValueError(
+                self.tr(
+                    f"{en_name} must be greater than zero.",
+                    f"{ar_name} يجب أن يكون أكبر من صفر.",
+                )
+            )
+
+        return value
+
+    def current_video_size(self):
+        width = round(float(self.video_width_var.get()))
+        height = max(150, round(width * VIDEO_ASPECT_RATIO))
+        return width, height
+
+    def sync_video_panel_size(self):
+        if not hasattr(self, "video_panel"):
+            return
+
+        width, height = self.current_video_size()
+        self.video_panel.config(width=width, height=height)
+        self.video_label.config(wraplength=max(160, width - 36))
+        self.video_size_value.config(text=f"{width} x {height} px")
+
+    def set_video_status(self, message):
+        if hasattr(self, "video_status_label"):
+            self.video_status_label.config(text=message)
+
+    def set_video_buttons_state(self):
+        if not hasattr(self, "video_play_button"):
+            return
+
+        has_video = self.current_video is not None
+        self.video_play_button.config(
+            state=tk.NORMAL if has_video and (not self.video_playing or self.video_paused) else tk.DISABLED
+        )
+        self.video_pause_button.config(
+            state=tk.NORMAL if has_video and self.video_playing and not self.video_paused else tk.DISABLED
+        )
+        self.video_restart_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
+        self.video_open_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
+
+    def show_video_placeholder(self, message):
+        self.sync_video_panel_size()
+        self.video_label.config(image="", text=message)
+        self.video_label.image = None
+
+    def display_video_frame(self, session_id, frame):
+        if session_id != self.video_session_id:
+            return
+
+        self.video_frame_seen = True
+        photo = ImageTk.PhotoImage(frame)
+        self.video_label.config(image=photo, text="")
+        self.video_label.image = photo
+
+    @staticmethod
+    def read_video_frame(stdout, frame_size):
+        chunks = []
+        remaining = frame_size
+
+        while remaining > 0:
+            chunk = stdout.read(remaining)
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
+        return b"".join(chunks)
+
+    @staticmethod
+    def build_ffmpeg_command(video_url, width, height):
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            return None
+
+        scale_filter = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,"
+            f"fps={VIDEO_FPS}"
+        )
+        return [
+            ffmpeg_path,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-user_agent",
+            HTTP_HEADERS["User-Agent"],
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "4",
+            "-i",
+            video_url,
+            "-an",
+            "-vf",
+            scale_filter,
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+
+    def video_reader(self, session_id, process, width, height):
+        frame_size = width * height * 3
+        frame_delay = 1 / VIDEO_FPS
+        next_frame_time = time.monotonic()
+
+        try:
+            while session_id == self.video_session_id:
+                while self.video_paused and session_id == self.video_session_id:
+                    time.sleep(0.05)
+
+                frame_data = self.read_video_frame(process.stdout, frame_size)
+                if frame_data is None:
+                    break
+
+                frame = Image.frombytes("RGB", (width, height), frame_data)
+                try:
+                    self.root.after(0, lambda sid=session_id, image=frame: self.display_video_frame(sid, image))
+                except tk.TclError:
+                    break
+
+                next_frame_time += frame_delay
+                delay = next_frame_time - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    next_frame_time = time.monotonic()
+        finally:
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+
+            try:
+                self.root.after(0, lambda sid=session_id: self.finish_video_playback(sid))
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def terminate_video_process(process):
+        if process is None or process.poll() is not None:
+            return
+
+        process.terminate()
         try:
             process.wait(timeout=0.6)
         except subprocess.TimeoutExpired:
-            pass
+            process.kill()
+            try:
+                process.wait(timeout=0.6)
+            except subprocess.TimeoutExpired:
+                pass
 
+    def stop_video_playback(self, clear_frame=False):
+        self.video_session_id += 1
+        process = self.video_process
+        self.video_process = None
+        self.video_playing = False
+        self.video_paused = False
+        self.video_frame_seen = False
+        self.terminate_video_process(process)
 
-def stop_video_playback(clear_frame=False):
-    global video_session_id, video_process, video_playing, video_paused, video_frame_seen
+        if clear_frame and hasattr(self, "video_label"):
+            self.show_video_placeholder(self.tr("Video preview", "معاينة الفيديو"))
 
-    video_session_id += 1
-    process = video_process
-    video_process = None
-    video_playing = False
-    video_paused = False
-    video_frame_seen = False
-    terminate_video_process(process)
+        self.set_video_buttons_state()
 
-    if clear_frame and "video_label" in globals():
-        show_video_placeholder(t("Video preview", "معاينة الفيديو"))
+    def start_video_playback(self, video):
+        if video is None:
+            return
 
-    set_video_buttons_state()
-
-
-def start_video_playback(video):
-    global video_session_id, video_process, video_playing, video_paused, video_frame_seen
-
-    if video is None:
-        return
-
-    stop_video_playback(clear_frame=False)
-    width, height = current_video_size()
-    command = build_ffmpeg_command(video["url"], width, height)
-    if command is None:
-        show_video_placeholder(
-            t(
-                "Video found, but ffmpeg is required for in-app playback. Use Open Video.",
-                "تم العثور على فيديو، لكن ffmpeg مطلوب للتشغيل داخل التطبيق. استخدم فتح الفيديو.",
+        self.stop_video_playback(clear_frame=False)
+        width, height = self.current_video_size()
+        command = self.build_ffmpeg_command(video["url"], width, height)
+        if command is None:
+            self.show_video_placeholder(
+                self.tr(
+                    "Video found, but ffmpeg is required for in-app playback. Use Open Video.",
+                    "تم العثور على فيديو، لكن ffmpeg مطلوب للتشغيل داخل التطبيق. استخدم فتح الفيديو.",
+                )
             )
-        )
-        set_video_status(t("Playback unavailable: ffmpeg is not installed.", "التشغيل غير متاح: ffmpeg غير مثبت."))
-        set_video_buttons_state()
-        return
-
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=width * height * 3,
-        )
-    except OSError as exc:
-        show_video_placeholder(t("Could not start video playback.", "تعذر بدء تشغيل الفيديو."))
-        set_video_status(str(exc))
-        set_video_buttons_state()
-        return
-
-    video_session_id += 1
-    session_id = video_session_id
-    video_process = process
-    video_playing = True
-    video_paused = False
-    video_frame_seen = False
-    show_video_placeholder(t("Starting video...", "جاري بدء الفيديو..."))
-    set_video_status(t(f"Playing: {video_title(video['title'])}", f"تشغيل: {video_title(video['title'])}"))
-    set_video_buttons_state()
-    threading.Thread(target=video_reader, args=(session_id, process, width, height), daemon=True).start()
-
-
-def finish_video_playback(session_id):
-    global video_process, video_playing, video_paused
-
-    if session_id != video_session_id:
-        return
-
-    video_process = None
-    video_playing = False
-    video_paused = False
-    if not video_frame_seen:
-        show_video_placeholder(
-            t(
-                "Video found, but playback could not start. Use Open Video.",
-                "تم العثور على فيديو، لكن تعذر تشغيله. استخدم فتح الفيديو.",
+            self.set_video_status(
+                self.tr("Playback unavailable: ffmpeg is not installed.", "التشغيل غير متاح: ffmpeg غير مثبت.")
             )
-        )
-        set_video_status(t("Playback failed for this online video.", "فشل تشغيل هذا الفيديو من الإنترنت."))
-    else:
-        set_video_status(t("Video ended. Use Restart to replay.", "انتهى الفيديو. استخدم إعادة التشغيل للمشاهدة مرة أخرى."))
+            self.set_video_buttons_state()
+            return
 
-    set_video_buttons_state()
-
-
-def play_current_video():
-    global video_paused
-
-    if current_video is None:
-        return
-
-    if video_playing and video_paused:
-        video_paused = False
-        set_video_status(t(f"Playing: {video_title(current_video['title'])}", f"تشغيل: {video_title(current_video['title'])}"))
-        set_video_buttons_state()
-        return
-
-    start_video_playback(current_video)
-
-
-def pause_current_video():
-    global video_paused
-
-    if not video_playing:
-        return
-
-    video_paused = True
-    set_video_status(t("Paused.", "متوقف مؤقتًا."))
-    set_video_buttons_state()
-
-
-def restart_current_video():
-    if current_video is not None:
-        start_video_playback(current_video)
-
-
-def open_current_video():
-    if current_video is None:
-        return
-
-    webbrowser.open(current_video.get("page_url") or current_video["url"])
-
-
-def resize_video_display(value=None):
-    sync_video_panel_size()
-
-
-def finish_video_load(request_id, video_result):
-    global current_video
-
-    if request_id != video_request_id:
-        return
-
-    if video_result is None:
-        current_video = None
-        show_video_placeholder(
-            t(
-                "No matching online video found. Check your internet connection and try again.",
-                "لم يتم العثور على فيديو مطابق من الإنترنت. تحقق من الاتصال ثم حاول مرة أخرى.",
-            )
-        )
-        set_video_status("")
-        set_video_buttons_state()
-        return
-
-    video = video_result["video"]
-    current_video = video
-    source = video_result.get("source", "Online match") if lang == "en" else video_result.get("source_ar", "نتيجة من الإنترنت")
-    reason = video_result.get("reason", "")
-    reason_text = f" ({reason})" if reason else ""
-    set_video_status(
-        t(
-            f"{source}: {video_title(video['title'])}{reason_text}",
-            f"{source}: {video_title(video['title'])}{reason_text}",
-        )
-    )
-    set_video_buttons_state()
-    start_video_playback(video)
-
-
-def load_video(search_groups, ship_type, speed_knots, estimate, recommendation):
-    global video_request_id, current_video
-
-    video_request_id += 1
-    request_id = video_request_id
-    current_video = None
-    stop_video_playback(clear_frame=False)
-    show_video_placeholder(
-        t(
-            f"Searching online for a {estimate['blades']}-blade propeller video matching {estimate_spec_text(estimate)}...",
-            f"جاري البحث عبر الإنترنت عن فيديو رفاس بعدد {estimate['blades']} شفرات مطابق للمواصفات...",
-        )
-    )
-    set_video_status(t("Searching public archive videos with Llama assistance...", "جاري البحث في فيديوهات الأرشيف العام بمساعدة Llama..."))
-    set_video_buttons_state()
-
-    def publish_status(en_message, ar_message):
         try:
-            root.after(0, lambda: set_video_status(t(en_message, ar_message)))
-        except tk.TclError:
-            pass
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=width * height * 3,
+            )
+        except OSError as exc:
+            self.show_video_placeholder(self.tr("Could not start video playback.", "تعذر بدء تشغيل الفيديو."))
+            self.set_video_status(str(exc))
+            self.set_video_buttons_state()
+            return
 
-    def worker():
-        video_result = fetch_archive_search_video(
-            search_groups,
-            ship_type,
-            speed_knots,
-            estimate,
-            recommendation,
-            publish_status,
+        self.video_session_id += 1
+        session_id = self.video_session_id
+        self.video_process = process
+        self.video_playing = True
+        self.video_paused = False
+        self.video_frame_seen = False
+        self.show_video_placeholder(self.tr("Starting video...", "جاري بدء الفيديو..."))
+        title = video_title(video["title"], self.lang)
+        self.set_video_status(self.tr(f"Playing: {title}", f"تشغيل: {title}"))
+        self.set_video_buttons_state()
+        threading.Thread(target=self.video_reader, args=(session_id, process, width, height), daemon=True).start()
+
+    def finish_video_playback(self, session_id):
+        if session_id != self.video_session_id:
+            return
+
+        self.video_process = None
+        self.video_playing = False
+        self.video_paused = False
+        if not self.video_frame_seen:
+            self.show_video_placeholder(
+                self.tr(
+                    "Video found, but playback could not start. Use Open Video.",
+                    "تم العثور على فيديو، لكن تعذر تشغيله. استخدم فتح الفيديو.",
+                )
+            )
+            self.set_video_status(self.tr("Playback failed for this online video.", "فشل تشغيل هذا الفيديو من الإنترنت."))
+        else:
+            self.set_video_status(
+                self.tr("Video ended. Use Restart to replay.", "انتهى الفيديو. استخدم إعادة التشغيل للمشاهدة مرة أخرى.")
+            )
+
+        self.set_video_buttons_state()
+
+    def play_current_video(self):
+        if self.current_video is None:
+            return
+
+        if self.video_playing and self.video_paused:
+            self.video_paused = False
+            title = video_title(self.current_video["title"], self.lang)
+            self.set_video_status(self.tr(f"Playing: {title}", f"تشغيل: {title}"))
+            self.set_video_buttons_state()
+            return
+
+        self.start_video_playback(self.current_video)
+
+    def pause_current_video(self):
+        if not self.video_playing:
+            return
+
+        self.video_paused = True
+        self.set_video_status(self.tr("Paused.", "متوقف مؤقتًا."))
+        self.set_video_buttons_state()
+
+    def restart_current_video(self):
+        if self.current_video is not None:
+            self.start_video_playback(self.current_video)
+
+    def open_current_video(self):
+        if self.current_video is None:
+            return
+
+        webbrowser.open(self.current_video.get("page_url") or self.current_video["url"])
+
+    def resize_video_display(self, value=None):
+        self.sync_video_panel_size()
+
+    def finish_video_load(self, request_id, video_result):
+        if request_id != self.video_request_id:
+            return
+
+        if video_result is None:
+            self.current_video = None
+            self.show_video_placeholder(
+                self.tr(
+                    "No matching online video found. Check your internet connection and try again.",
+                    "لم يتم العثور على فيديو مطابق من الإنترنت. تحقق من الاتصال ثم حاول مرة أخرى.",
+                )
+            )
+            self.set_video_status("")
+            self.set_video_buttons_state()
+            return
+
+        video = video_result["video"]
+        self.current_video = video
+        source = (
+            video_result.get("source", "Online match")
+            if self.lang == "en"
+            else video_result.get("source_ar", "نتيجة من الإنترنت")
         )
+        reason = video_result.get("reason", "")
+        reason_text = f" ({reason})" if reason else ""
+        self.set_video_status(f"{source}: {video_title(video['title'], self.lang)}{reason_text}")
+        self.set_video_buttons_state()
+        self.start_video_playback(video)
+
+    def load_video(self, search_groups, ship_type, speed_knots, estimate, recommendation):
+        self.video_request_id += 1
+        request_id = self.video_request_id
+        self.current_video = None
+        self.stop_video_playback(clear_frame=False)
+        self.show_video_placeholder(
+            self.tr(
+                f"Searching online for a {estimate['blades']}-blade propeller video matching {estimate_spec_text(estimate)}...",
+                f"جاري البحث عبر الإنترنت عن فيديو رفاس بعدد {estimate['blades']} شفرات مطابق للمواصفات...",
+            )
+        )
+        self.set_video_status(
+            self.tr(
+                "Searching public archive videos with Llama assistance...",
+                "جاري البحث في فيديوهات الأرشيف العام بمساعدة Llama...",
+            )
+        )
+        self.set_video_buttons_state()
+
+        def publish_status(en_message, ar_message):
+            try:
+                self.root.after(0, lambda: self.set_video_status(self.tr(en_message, ar_message)))
+            except tk.TclError:
+                pass
+
+        def worker():
+            video_result = fetch_archive_search_video(
+                search_groups,
+                ship_type,
+                speed_knots,
+                estimate,
+                recommendation,
+                publish_status,
+            )
+            try:
+                self.root.after(0, lambda: self.finish_video_load(request_id, video_result))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def clear_outputs(self):
+        self.video_request_id += 1
+        self.current_video = None
+        self.stop_video_playback(clear_frame=False)
+        self.result_label.config(text="", style="Result.TLabel")
+        self.recommendation_label.config(text="")
+        self.show_video_placeholder(self.tr("Video preview", "معاينة الفيديو"))
+        self.set_video_status("")
+        self.set_video_buttons_state()
+
+    def reset(self):
+        self.entry_power.delete(0, tk.END)
+        self.entry_speed.delete(0, tk.END)
+        self.set_ship_combo(SHIP_TYPES[0])
+        self.clear_outputs()
+
+    def calculate(self):
         try:
-            root.after(0, lambda: finish_video_load(request_id, video_result))
-        except tk.TclError:
-            pass
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def clear_outputs():
-    global video_request_id, current_video
-
-    video_request_id += 1
-    current_video = None
-    stop_video_playback(clear_frame=False)
-    result_label.config(text="", style="Result.TLabel")
-    recommendation_label.config(text="")
-    show_video_placeholder(t("Video preview", "معاينة الفيديو"))
-    set_video_status("")
-    set_video_buttons_state()
-
-
-def reset():
-    entry_power.delete(0, tk.END)
-    entry_speed.delete(0, tk.END)
-    set_ship_combo(SHIP_TYPES[0])
-    clear_outputs()
-
-
-def calculate():
-    try:
-        power = read_positive_number(entry_power, "Power", "القدرة")
-        speed_knots = read_positive_number(entry_speed, "Speed", "السرعة")
-        ship_type = get_selected_ship_type()
-
-        if ship_type not in SHIP_RPM_FACTORS:
-            raise ValueError(t("Choose a valid ship type.", "اختر نوع سفينة صحيحًا."))
-
-        estimate = estimate_propeller(power, speed_knots, ship_type)
-    except ValueError as exc:
-        result_label.config(text=str(exc), style="Error.TLabel")
-        recommendation_label.config(text="")
-        return
-
-    recommendation = recommend_propeller(ship_type, speed_knots, estimate["slip"])
-    search_groups = build_video_queries(ship_type, speed_knots, estimate, recommendation)
-    efficiency_percent = estimate["efficiency"] * 100
-    note = slip_note(estimate["slip"])
-
-    lines = [
-        metric_line("Ship", "السفينة", ship_display_name(ship_type)),
-        metric_line("RPM", "عدد الدورات في الدقيقة", f"{estimate['rpm']:.2f}"),
-        metric_line("Blades", "الشفرات", f"{estimate['blades']}"),
-        metric_line("Diameter", "القطر", f"{estimate['diameter']:.2f} {t('m', 'متر')}"),
-        metric_line("Pitch", "الميل", f"{estimate['pitch']:.2f} {t('m', 'متر')}"),
-        metric_line("Slip", "الانزلاق", f"{estimate['slip']:.3f}"),
-        metric_line("Efficiency", "الكفاءة", f"{efficiency_percent:.2f}%"),
-    ]
-
-    if note:
-        lines.extend(("", note))
-
-    result_label.config(text="\n".join(lines), style="Result.TLabel")
-    recommendation_lines = [
-        t("Recommendation", "التوصية"),
-        recommendation["en"] if lang == "en" else recommendation["ar"],
-    ]
-    recommendation_label.config(text="\n".join(recommendation_lines))
-    load_video(search_groups, ship_type, speed_knots, estimate, recommendation)
-
-
-def change_lang(event=None):
-    global lang
-
-    lang = lang_combo.get()
-    refresh_language()
-
-
-def configure_styles():
-    style.configure("App.TFrame", background=APP_BG)
-    style.configure("Header.TFrame", background=APP_BG)
-    style.configure("Panel.TLabelframe", background=SURFACE, bordercolor=BORDER, relief="solid")
-    style.configure(
-        "Panel.TLabelframe.Label",
-        background=APP_BG,
-        foreground=TEXT,
-        font=app_font(11, "bold"),
-    )
-    style.configure("Panel.TFrame", background=SURFACE)
-    style.configure("Title.TLabel", background=APP_BG, foreground=TEXT, font=app_font(24, "bold"))
-    style.configure("HeaderField.TLabel", background=APP_BG, foreground=MUTED_TEXT, font=app_font(10))
-    style.configure("Field.TLabel", background=SURFACE, foreground=MUTED_TEXT, font=app_font(10))
-    style.configure(
-        "TEntry",
-        bordercolor=BORDER,
-        fieldbackground=SURFACE_SOFT,
-        foreground=TEXT,
-        lightcolor=BORDER,
-        padding=7,
-    )
-    style.configure(
-        "TCombobox",
-        arrowsize=14,
-        bordercolor=BORDER,
-        fieldbackground=SURFACE_SOFT,
-        foreground=TEXT,
-        lightcolor=BORDER,
-        padding=7,
-    )
-    style.configure(
-        "Result.TLabel",
-        background=SURFACE,
-        foreground=TEXT,
-        font=app_font(10),
-        justify="right" if lang == "ar" else "left",
-    )
-    style.configure(
-        "Error.TLabel",
-        background=SURFACE,
-        foreground=DANGER,
-        font=app_font(10, "bold"),
-        justify="right" if lang == "ar" else "left",
-    )
-    style.configure(
-        "Accent.TButton",
-        background=ACCENT,
-        bordercolor=ACCENT,
-        darkcolor=ACCENT,
-        foreground="#ffffff",
-        focuscolor=ACCENT,
-        font=app_font(10, "bold"),
-        lightcolor=ACCENT,
-        padding=(14, 9),
-        relief="flat",
-    )
-    style.map(
-        "Accent.TButton",
-        background=[("active", ACCENT_DARK), ("disabled", "#9fb8b5")],
-        foreground=[("disabled", "#ecfdf5")],
-    )
-    style.configure(
-        "Plain.TButton",
-        background="#e8eef5",
-        bordercolor="#d6e0ea",
-        foreground=TEXT,
-        focuscolor="#e8eef5",
-        font=app_font(10),
-        padding=(14, 9),
-        relief="flat",
-    )
-    style.map(
-        "Plain.TButton",
-        background=[("active", "#dbe7f3"), ("disabled", "#edf2f7")],
-        foreground=[("disabled", "#94a3b8")],
-    )
-    style.configure(
-        "Secondary.TButton",
-        background=SECONDARY,
-        bordercolor=SECONDARY,
-        foreground="#ffffff",
-        focuscolor=SECONDARY,
-        font=app_font(10, "bold"),
-        padding=(14, 9),
-        relief="flat",
-    )
-    style.map("Secondary.TButton", background=[("active", SECONDARY_DARK), ("disabled", "#9bb7ea")])
-
-
-def apply_language_layout():
-    is_arabic = lang == "ar"
-    sticky_side = "e" if is_arabic else "w"
-    opposite_side = "w" if is_arabic else "e"
-    justify = "right" if is_arabic else "left"
-
-    title_label.grid_configure(sticky=sticky_side)
-    language_frame.grid_configure(sticky=opposite_side)
-    language_label.config(anchor=sticky_side, justify=justify)
-
-    for label in (
-        power_label,
-        speed_label,
-        ship_label,
-        result_label,
-        recommendation_label,
-        video_size_label,
-        video_size_value,
-        video_status_label,
-    ):
-        label.config(anchor=sticky_side, justify=justify)
-
-    result_label.grid_configure(sticky="ew")
-    recommendation_label.grid_configure(sticky="ew")
-    entry_power.config(justify="right" if is_arabic else "left")
-    entry_speed.config(justify="right" if is_arabic else "left")
-    video_label.config(font=app_font(10), justify="center")
-
-
-def refresh_language():
-    selected_ship_type = get_selected_ship_type() or SHIP_TYPES[0]
-
-    configure_styles()
-    apply_language_layout()
-
-    root.title(t("Marine Propeller Advisor", "مستشار الرفاس البحري"))
-    title_label.config(text=t("Marine Propeller Advisor", "مستشار الرفاس البحري"))
-    language_label.config(text=t("Language", "اللغة"))
-    input_frame.config(text=t("Inputs", "المدخلات"))
-    power_label.config(text=t("Power (kW)", "القدرة (kW)"))
-    speed_label.config(text=t("Speed (knots)", "السرعة (عقدة)"))
-    ship_label.config(text=t("Ship Type", "نوع السفينة"))
-    entry_power.config(font=app_font(11))
-    entry_speed.config(font=app_font(11))
-    calculate_button.config(text=t("Calculate", "احسب"))
-    reset_button.config(text=t("Reset", "إعادة ضبط"))
-    result_frame.config(text=t("Estimate", "التقدير"))
-    recommendation_frame.config(text=t("Recommendation", "التوصية"))
-    video_frame.config(text=t("Visualizer", "العارض"))
-    video_size_label.config(text=t("Video width", "عرض الفيديو"))
-    video_play_button.config(text=t("Play", "تشغيل"))
-    video_pause_button.config(text=t("Pause", "إيقاف مؤقت"))
-    video_restart_button.config(text=t("Restart", "إعادة تشغيل"))
-    video_open_button.config(text=t("Open Video", "فتح الفيديو"))
-    video_size_reset_button.config(text=t("Reset size", "إعادة الحجم"))
-    lang_combo.config(font=app_font(10))
-    ship_combo.config(values=ship_display_values(), font=app_font(10))
-    set_ship_combo(selected_ship_type)
-    set_video_buttons_state()
-
-    if not result_label.cget("text") and not recommendation_label.cget("text"):
-        show_video_placeholder(t("Video preview", "معاينة الفيديو"))
-
-
-def update_scroll_region(event=None):
-    scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
-
-
-def resize_scroll_frame(event):
-    requested_width = main_frame.winfo_reqwidth()
-    requested_height = main_frame.winfo_reqheight()
-    scroll_canvas.itemconfigure(
-        main_window,
-        width=max(event.width, requested_width),
-        height=max(event.height, requested_height),
-    )
-
-    if "result_label" in globals():
-        side_width = side_column.winfo_width() if "side_column" in globals() else 0
-        visualizer_width = visualizer_column.winfo_width() if "visualizer_column" in globals() else 0
-        info_wrap = max(260, side_width - 52) if side_width > 1 else max(280, event.width // 3)
-        video_wrap = max(280, visualizer_width - 52) if visualizer_width > 1 else max(320, event.width // 2)
-        result_label.config(wraplength=info_wrap)
-        recommendation_label.config(wraplength=info_wrap)
-        if "video_status_label" in globals():
-            video_status_label.config(wraplength=video_wrap)
-
-
-def on_mousewheel(event):
-    if event.num == 4:
-        scroll_canvas.yview_scroll(-1, "units")
-    elif event.num == 5:
-        scroll_canvas.yview_scroll(1, "units")
-    else:
-        scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-
-def reset_video_size():
-    video_width_var.set(DEFAULT_VIDEO_WIDTH)
-    resize_video_display()
-
-
-def close_app():
-    stop_video_playback(clear_frame=False)
-    root.destroy()
-
-
-root = tk.Tk()
-root.geometry("1120x760")
-root.minsize(920, 620)
-root.configure(bg=APP_BG)
-root.rowconfigure(0, weight=1)
-root.columnconfigure(0, weight=1)
-
-LATIN_FONT = choose_font(["Segoe UI", "Noto Sans", "DejaVu Sans", "Arial"])
-ARABIC_FONT = choose_font(["Noto Sans Arabic", "Amiri", "DejaVu Sans", "Arial"])
-video_width_var = tk.DoubleVar(value=DEFAULT_VIDEO_WIDTH)
-
-style = ttk.Style(root)
-try:
-    style.theme_use("clam")
-except tk.TclError:
-    pass
-configure_styles()
-
-scroll_canvas = tk.Canvas(root, bg=APP_BG, highlightthickness=0)
-vertical_scrollbar = ttk.Scrollbar(root, orient="vertical", command=scroll_canvas.yview)
-horizontal_scrollbar = ttk.Scrollbar(root, orient="horizontal", command=scroll_canvas.xview)
-scroll_canvas.configure(
-    yscrollcommand=vertical_scrollbar.set,
-    xscrollcommand=horizontal_scrollbar.set,
-)
-scroll_canvas.grid(row=0, column=0, sticky="nsew")
-vertical_scrollbar.grid(row=0, column=1, sticky="ns")
-horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
-
-main_frame = ttk.Frame(scroll_canvas, padding=(28, 24), style="App.TFrame")
-main_window = scroll_canvas.create_window((0, 0), window=main_frame, anchor="nw")
-main_frame.bind("<Configure>", update_scroll_region)
-scroll_canvas.bind("<Configure>", resize_scroll_frame)
-root.bind_all("<MouseWheel>", on_mousewheel)
-root.bind_all("<Button-4>", on_mousewheel)
-root.bind_all("<Button-5>", on_mousewheel)
-main_frame.columnconfigure(0, weight=1)
-main_frame.rowconfigure(1, weight=1)
-
-header_frame = ttk.Frame(main_frame, style="Header.TFrame")
-header_frame.grid(row=0, column=0, sticky="ew")
-header_frame.columnconfigure(0, weight=1)
-
-title_label = ttk.Label(header_frame, style="Title.TLabel")
-title_label.grid(row=0, column=0, sticky="w")
-
-language_frame = ttk.Frame(header_frame, style="Header.TFrame")
-language_frame.grid(row=0, column=1, sticky="e")
-
-language_label = ttk.Label(language_frame, style="HeaderField.TLabel")
-language_label.grid(row=0, column=0, padx=(0, 8))
-
-lang_combo = ttk.Combobox(language_frame, values=["en", "ar"], width=6, state="readonly")
-lang_combo.grid(row=0, column=1)
-lang_combo.set(lang)
-lang_combo.bind("<<ComboboxSelected>>", change_lang)
-
-accent_bar = tk.Frame(header_frame, height=4, bg=ACCENT)
-accent_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-
-body_frame = ttk.Frame(main_frame, style="App.TFrame")
-body_frame.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
-body_frame.columnconfigure(0, weight=3, minsize=520)
-body_frame.columnconfigure(1, weight=2, minsize=340)
-body_frame.rowconfigure(0, weight=1)
-
-visualizer_column = ttk.Frame(body_frame, style="App.TFrame")
-visualizer_column.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
-visualizer_column.columnconfigure(0, weight=1)
-visualizer_column.rowconfigure(0, weight=1)
-
-side_column = ttk.Frame(body_frame, style="App.TFrame")
-side_column.grid(row=0, column=1, sticky="nsew", padx=(18, 0))
-side_column.columnconfigure(0, weight=1)
-side_column.rowconfigure(1, weight=1)
-side_column.rowconfigure(2, weight=1)
-
-input_frame = ttk.LabelFrame(side_column, padding=(18, 16), style="Panel.TLabelframe")
-input_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-input_frame.columnconfigure(1, weight=1)
-
-power_label = ttk.Label(input_frame, style="Field.TLabel")
-power_label.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=6)
-entry_power = ttk.Entry(input_frame)
-entry_power.grid(row=0, column=1, sticky="ew", pady=6)
-
-speed_label = ttk.Label(input_frame, style="Field.TLabel")
-speed_label.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=6)
-entry_speed = ttk.Entry(input_frame)
-entry_speed.grid(row=1, column=1, sticky="ew", pady=6)
-
-ship_label = ttk.Label(input_frame, style="Field.TLabel")
-ship_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=6)
-ship_combo = ttk.Combobox(input_frame, values=SHIP_TYPES, state="readonly")
-ship_combo.grid(row=2, column=1, sticky="ew", pady=6)
-set_ship_combo(SHIP_TYPES[0])
-
-button_frame = ttk.Frame(input_frame, style="Panel.TFrame")
-button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-button_frame.columnconfigure(0, weight=1)
-button_frame.columnconfigure(1, weight=1)
-
-calculate_button = ttk.Button(button_frame, command=calculate, style="Accent.TButton")
-calculate_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-reset_button = ttk.Button(button_frame, command=reset, style="Plain.TButton")
-reset_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-
-result_frame = ttk.LabelFrame(side_column, padding=(18, 16), style="Panel.TLabelframe")
-result_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 14))
-result_frame.columnconfigure(0, weight=1)
-result_frame.rowconfigure(0, weight=1)
-
-result_label = ttk.Label(result_frame, text="", wraplength=540, style="Result.TLabel")
-result_label.grid(row=0, column=0, sticky="new")
-
-recommendation_frame = ttk.LabelFrame(side_column, padding=(18, 16), style="Panel.TLabelframe")
-recommendation_frame.grid(row=2, column=0, sticky="nsew")
-recommendation_frame.columnconfigure(0, weight=1)
-recommendation_frame.rowconfigure(0, weight=1)
-
-recommendation_label = ttk.Label(recommendation_frame, text="", wraplength=540, style="Result.TLabel")
-recommendation_label.grid(row=0, column=0, sticky="new")
-
-video_frame = ttk.LabelFrame(visualizer_column, padding=(18, 16), style="Panel.TLabelframe")
-video_frame.grid(row=0, column=0, sticky="nsew")
-
-video_button_frame = ttk.Frame(video_frame, style="Panel.TFrame")
-video_button_frame.pack(side="bottom", fill="x", pady=(12, 0))
-for column in range(4):
-    video_button_frame.columnconfigure(column, weight=1)
-
-video_play_button = ttk.Button(
-    video_button_frame,
-    command=play_current_video,
-    style="Accent.TButton",
-)
-video_play_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-
-video_pause_button = ttk.Button(
-    video_button_frame,
-    command=pause_current_video,
-    style="Plain.TButton",
-)
-video_pause_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-
-video_restart_button = ttk.Button(
-    video_button_frame,
-    command=restart_current_video,
-    style="Plain.TButton",
-)
-video_restart_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
-
-video_open_button = ttk.Button(
-    video_button_frame,
-    command=open_current_video,
-    style="Secondary.TButton",
-)
-video_open_button.grid(row=0, column=3, sticky="ew")
-
-video_size_frame = ttk.Frame(video_frame, style="Panel.TFrame")
-video_size_frame.pack(side="bottom", fill="x", pady=(10, 0))
-video_size_frame.columnconfigure(1, weight=1)
-
-video_size_label = ttk.Label(video_size_frame, style="Field.TLabel")
-video_size_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
-
-video_width_slider = ttk.Scale(
-    video_size_frame,
-    from_=MIN_VIDEO_WIDTH,
-    to=MAX_VIDEO_WIDTH,
-    variable=video_width_var,
-    command=resize_video_display,
-)
-video_width_slider.grid(row=0, column=1, sticky="ew", padx=(0, 10))
-
-video_size_value = ttk.Label(video_size_frame, width=14, style="Field.TLabel")
-video_size_value.grid(row=0, column=2, sticky="e", padx=(0, 10))
-
-video_size_reset_button = ttk.Button(
-    video_size_frame,
-    command=reset_video_size,
-    style="Plain.TButton",
-)
-video_size_reset_button.grid(row=0, column=3, sticky="e")
-
-video_status_label = ttk.Label(video_frame, text="", wraplength=540, style="Field.TLabel")
-video_status_label.pack(side="bottom", fill="x", pady=(10, 0))
-
-initial_video_width, initial_video_height = current_video_size()
-video_panel = tk.Frame(
-    video_frame,
-    width=initial_video_width,
-    height=initial_video_height,
-    bg=VIDEO_SURFACE,
-    highlightbackground=ACCENT,
-    highlightthickness=1,
-)
-video_panel.pack(fill="both", expand=True, pady=(6, 0))
-video_panel.pack_propagate(False)
-
-video_label = tk.Label(
-    video_panel,
-    bg=VIDEO_SURFACE,
-    fg="#dbeafe",
-    font=app_font(10),
-    justify="center",
-    wraplength=400,
-)
-video_label.pack(fill="both", expand=True)
-
-refresh_language()
-root.protocol("WM_DELETE_WINDOW", close_app)
-root.mainloop()
+            power = self.read_positive_number(self.entry_power, "Power", "القدرة")
+            speed_knots = self.read_positive_number(self.entry_speed, "Speed", "السرعة")
+            ship_type = self.get_selected_ship_type()
+
+            if ship_type not in SHIP_RPM_FACTORS:
+                raise ValueError(self.tr("Choose a valid ship type.", "اختر نوع سفينة صحيحًا."))
+
+            estimate = estimate_propeller(power, speed_knots, ship_type, self.lang)
+        except ValueError as exc:
+            self.result_label.config(text=str(exc), style="Error.TLabel")
+            self.recommendation_label.config(text="")
+            return
+
+        recommendation = recommend_propeller(ship_type, speed_knots, estimate["slip"])
+        search_groups = build_video_queries(ship_type, speed_knots, estimate, recommendation)
+        efficiency_percent = estimate["efficiency"] * 100
+        note = slip_note(estimate["slip"], self.lang)
+
+        lines = [
+            self.metric_line("Ship", "السفينة", ship_display_name(ship_type, self.lang)),
+            self.metric_line("RPM", "عدد الدورات في الدقيقة", f"{estimate['rpm']:.2f}"),
+            self.metric_line("Blades", "الشفرات", f"{estimate['blades']}"),
+            self.metric_line("Diameter", "القطر", f"{estimate['diameter']:.2f} {self.tr('m', 'متر')}"),
+            self.metric_line("Pitch", "الميل", f"{estimate['pitch']:.2f} {self.tr('m', 'متر')}"),
+            self.metric_line("Slip", "الانزلاق", f"{estimate['slip']:.3f}"),
+            self.metric_line("Efficiency", "الكفاءة", f"{efficiency_percent:.2f}%"),
+        ]
+
+        if note:
+            lines.extend(("", note))
+
+        self.result_label.config(text="\n".join(lines), style="Result.TLabel")
+        recommendation_lines = [
+            self.tr("Recommendation", "التوصية"),
+            recommendation["en"] if self.lang == "en" else recommendation["ar"],
+        ]
+        self.recommendation_label.config(text="\n".join(recommendation_lines))
+        self.load_video(search_groups, ship_type, speed_knots, estimate, recommendation)
+
+    def change_lang(self, event=None):
+        self.lang = self.lang_combo.get()
+        self.refresh_language()
+
+    def configure_styles(self):
+        self.style.configure("App.TFrame", background=APP_BG)
+        self.style.configure("Header.TFrame", background=APP_BG)
+        self.style.configure("Panel.TLabelframe", background=SURFACE, bordercolor=BORDER, relief="solid")
+        self.style.configure(
+            "Panel.TLabelframe.Label",
+            background=APP_BG,
+            foreground=TEXT,
+            font=self.app_font(11, "bold"),
+        )
+        self.style.configure("Panel.TFrame", background=SURFACE)
+        self.style.configure("Title.TLabel", background=APP_BG, foreground=TEXT, font=self.app_font(24, "bold"))
+        self.style.configure("HeaderField.TLabel", background=APP_BG, foreground=MUTED_TEXT, font=self.app_font(10))
+        self.style.configure("Field.TLabel", background=SURFACE, foreground=MUTED_TEXT, font=self.app_font(10))
+        self.style.configure(
+            "TEntry",
+            bordercolor=BORDER,
+            fieldbackground=SURFACE_SOFT,
+            foreground=TEXT,
+            lightcolor=BORDER,
+            padding=7,
+        )
+        self.style.configure(
+            "TCombobox",
+            arrowsize=14,
+            bordercolor=BORDER,
+            fieldbackground=SURFACE_SOFT,
+            foreground=TEXT,
+            lightcolor=BORDER,
+            padding=7,
+        )
+        self.style.configure(
+            "Result.TLabel",
+            background=SURFACE,
+            foreground=TEXT,
+            font=self.app_font(10),
+            justify="right" if self.lang == "ar" else "left",
+        )
+        self.style.configure(
+            "Error.TLabel",
+            background=SURFACE,
+            foreground=DANGER,
+            font=self.app_font(10, "bold"),
+            justify="right" if self.lang == "ar" else "left",
+        )
+        self.style.configure(
+            "Accent.TButton",
+            background=ACCENT,
+            bordercolor=ACCENT,
+            darkcolor=ACCENT,
+            foreground="#ffffff",
+            focuscolor=ACCENT,
+            font=self.app_font(10, "bold"),
+            lightcolor=ACCENT,
+            padding=(14, 9),
+            relief="flat",
+        )
+        self.style.map(
+            "Accent.TButton",
+            background=[("active", ACCENT_DARK), ("disabled", "#9fb8b5")],
+            foreground=[("disabled", "#ecfdf5")],
+        )
+        self.style.configure(
+            "Plain.TButton",
+            background="#e8eef5",
+            bordercolor="#d6e0ea",
+            foreground=TEXT,
+            focuscolor="#e8eef5",
+            font=self.app_font(10),
+            padding=(14, 9),
+            relief="flat",
+        )
+        self.style.map(
+            "Plain.TButton",
+            background=[("active", "#dbe7f3"), ("disabled", "#edf2f7")],
+            foreground=[("disabled", "#94a3b8")],
+        )
+        self.style.configure(
+            "Secondary.TButton",
+            background=SECONDARY,
+            bordercolor=SECONDARY,
+            foreground="#ffffff",
+            focuscolor=SECONDARY,
+            font=self.app_font(10, "bold"),
+            padding=(14, 9),
+            relief="flat",
+        )
+        self.style.map("Secondary.TButton", background=[("active", SECONDARY_DARK), ("disabled", "#9bb7ea")])
+
+    def apply_language_layout(self):
+        is_arabic = self.lang == "ar"
+        sticky_side = "e" if is_arabic else "w"
+        opposite_side = "w" if is_arabic else "e"
+        justify = "right" if is_arabic else "left"
+
+        self.title_label.grid_configure(sticky=sticky_side)
+        self.language_frame.grid_configure(sticky=opposite_side)
+        self.language_label.config(anchor=sticky_side, justify=justify)
+
+        for label in (
+            self.power_label,
+            self.speed_label,
+            self.ship_label,
+            self.result_label,
+            self.recommendation_label,
+            self.video_size_label,
+            self.video_size_value,
+            self.video_status_label,
+        ):
+            label.config(anchor=sticky_side, justify=justify)
+
+        self.result_label.grid_configure(sticky="ew")
+        self.recommendation_label.grid_configure(sticky="ew")
+        self.entry_power.config(justify="right" if is_arabic else "left")
+        self.entry_speed.config(justify="right" if is_arabic else "left")
+        self.video_label.config(font=self.app_font(10), justify="center")
+
+    def refresh_language(self):
+        selected_ship_type = self.get_selected_ship_type() or SHIP_TYPES[0]
+
+        self.configure_styles()
+        self.apply_language_layout()
+
+        self.root.title(self.tr("Marine Propeller Advisor", "مستشار الرفاس البحري"))
+        self.title_label.config(text=self.tr("Marine Propeller Advisor", "مستشار الرفاس البحري"))
+        self.language_label.config(text=self.tr("Language", "اللغة"))
+        self.input_frame.config(text=self.tr("Inputs", "المدخلات"))
+        self.power_label.config(text=self.tr("Power (kW)", "القدرة (kW)"))
+        self.speed_label.config(text=self.tr("Speed (knots)", "السرعة (عقدة)"))
+        self.ship_label.config(text=self.tr("Ship Type", "نوع السفينة"))
+        self.entry_power.config(font=self.app_font(11))
+        self.entry_speed.config(font=self.app_font(11))
+        self.calculate_button.config(text=self.tr("Calculate", "احسب"))
+        self.reset_button.config(text=self.tr("Reset", "إعادة ضبط"))
+        self.result_frame.config(text=self.tr("Estimate", "التقدير"))
+        self.recommendation_frame.config(text=self.tr("Recommendation", "التوصية"))
+        self.video_frame.config(text=self.tr("Visualizer", "العارض"))
+        self.video_size_label.config(text=self.tr("Video width", "عرض الفيديو"))
+        self.video_play_button.config(text=self.tr("Play", "تشغيل"))
+        self.video_pause_button.config(text=self.tr("Pause", "إيقاف مؤقت"))
+        self.video_restart_button.config(text=self.tr("Restart", "إعادة تشغيل"))
+        self.video_open_button.config(text=self.tr("Open Video", "فتح الفيديو"))
+        self.video_size_reset_button.config(text=self.tr("Reset size", "إعادة الحجم"))
+        self.lang_combo.config(font=self.app_font(10))
+        self.ship_combo.config(values=ship_display_values(self.lang), font=self.app_font(10))
+        self.set_ship_combo(selected_ship_type)
+        self.set_video_buttons_state()
+
+        if not self.result_label.cget("text") and not self.recommendation_label.cget("text"):
+            self.show_video_placeholder(self.tr("Video preview", "معاينة الفيديو"))
+
+    def update_scroll_region(self, event=None):
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def resize_scroll_frame(self, event):
+        requested_width = self.main_frame.winfo_reqwidth()
+        requested_height = self.main_frame.winfo_reqheight()
+        self.scroll_canvas.itemconfigure(
+            self.main_window,
+            width=max(event.width, requested_width),
+            height=max(event.height, requested_height),
+        )
+
+        if hasattr(self, "result_label"):
+            side_width = self.side_column.winfo_width() if hasattr(self, "side_column") else 0
+            visualizer_width = self.visualizer_column.winfo_width() if hasattr(self, "visualizer_column") else 0
+            info_wrap = max(260, side_width - 52) if side_width > 1 else max(280, event.width // 3)
+            video_wrap = max(280, visualizer_width - 52) if visualizer_width > 1 else max(320, event.width // 2)
+            self.result_label.config(wraplength=info_wrap)
+            self.recommendation_label.config(wraplength=info_wrap)
+            self.video_status_label.config(wraplength=video_wrap)
+
+    def on_mousewheel(self, event):
+        if event.num == 4:
+            self.scroll_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.scroll_canvas.yview_scroll(1, "units")
+        else:
+            self.scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def reset_video_size(self):
+        self.video_width_var.set(DEFAULT_VIDEO_WIDTH)
+        self.resize_video_display()
+
+    def close_app(self):
+        self.stop_video_playback(clear_frame=False)
+        self.root.destroy()
+
+    def build_layout(self):
+        self.scroll_canvas = tk.Canvas(self.root, bg=APP_BG, highlightthickness=0)
+        self.vertical_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.scroll_canvas.yview)
+        self.horizontal_scrollbar = ttk.Scrollbar(self.root, orient="horizontal", command=self.scroll_canvas.xview)
+        self.scroll_canvas.configure(
+            yscrollcommand=self.vertical_scrollbar.set,
+            xscrollcommand=self.horizontal_scrollbar.set,
+        )
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self.vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        self.main_frame = ttk.Frame(self.scroll_canvas, padding=(28, 24), style="App.TFrame")
+        self.main_window = self.scroll_canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
+        self.main_frame.bind("<Configure>", self.update_scroll_region)
+        self.scroll_canvas.bind("<Configure>", self.resize_scroll_frame)
+        self.root.bind_all("<MouseWheel>", self.on_mousewheel)
+        self.root.bind_all("<Button-4>", self.on_mousewheel)
+        self.root.bind_all("<Button-5>", self.on_mousewheel)
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.rowconfigure(1, weight=1)
+
+        self.header_frame = ttk.Frame(self.main_frame, style="Header.TFrame")
+        self.header_frame.grid(row=0, column=0, sticky="ew")
+        self.header_frame.columnconfigure(0, weight=1)
+
+        self.title_label = ttk.Label(self.header_frame, style="Title.TLabel")
+        self.title_label.grid(row=0, column=0, sticky="w")
+
+        self.language_frame = ttk.Frame(self.header_frame, style="Header.TFrame")
+        self.language_frame.grid(row=0, column=1, sticky="e")
+
+        self.language_label = ttk.Label(self.language_frame, style="HeaderField.TLabel")
+        self.language_label.grid(row=0, column=0, padx=(0, 8))
+
+        self.lang_combo = ttk.Combobox(self.language_frame, values=["en", "ar"], width=6, state="readonly")
+        self.lang_combo.grid(row=0, column=1)
+        self.lang_combo.set(self.lang)
+        self.lang_combo.bind("<<ComboboxSelected>>", self.change_lang)
+
+        self.accent_bar = tk.Frame(self.header_frame, height=4, bg=ACCENT)
+        self.accent_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+
+        self.body_frame = ttk.Frame(self.main_frame, style="App.TFrame")
+        self.body_frame.grid(row=1, column=0, sticky="nsew", pady=(20, 0))
+        self.body_frame.columnconfigure(0, weight=3, minsize=520)
+        self.body_frame.columnconfigure(1, weight=2, minsize=340)
+        self.body_frame.rowconfigure(0, weight=1)
+
+        self.visualizer_column = ttk.Frame(self.body_frame, style="App.TFrame")
+        self.visualizer_column.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+        self.visualizer_column.columnconfigure(0, weight=1)
+        self.visualizer_column.rowconfigure(0, weight=1)
+
+        self.side_column = ttk.Frame(self.body_frame, style="App.TFrame")
+        self.side_column.grid(row=0, column=1, sticky="nsew", padx=(18, 0))
+        self.side_column.columnconfigure(0, weight=1)
+        self.side_column.rowconfigure(1, weight=1)
+        self.side_column.rowconfigure(2, weight=1)
+
+        self.input_frame = ttk.LabelFrame(self.side_column, padding=(18, 16), style="Panel.TLabelframe")
+        self.input_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        self.input_frame.columnconfigure(1, weight=1)
+
+        self.power_label = ttk.Label(self.input_frame, style="Field.TLabel")
+        self.power_label.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.entry_power = ttk.Entry(self.input_frame)
+        self.entry_power.grid(row=0, column=1, sticky="ew", pady=6)
+
+        self.speed_label = ttk.Label(self.input_frame, style="Field.TLabel")
+        self.speed_label.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.entry_speed = ttk.Entry(self.input_frame)
+        self.entry_speed.grid(row=1, column=1, sticky="ew", pady=6)
+
+        self.ship_label = ttk.Label(self.input_frame, style="Field.TLabel")
+        self.ship_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.ship_combo = ttk.Combobox(self.input_frame, values=SHIP_TYPES, state="readonly")
+        self.ship_combo.grid(row=2, column=1, sticky="ew", pady=6)
+        self.set_ship_combo(SHIP_TYPES[0])
+
+        self.button_frame = ttk.Frame(self.input_frame, style="Panel.TFrame")
+        self.button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        self.button_frame.columnconfigure(0, weight=1)
+        self.button_frame.columnconfigure(1, weight=1)
+
+        self.calculate_button = ttk.Button(self.button_frame, command=self.calculate, style="Accent.TButton")
+        self.calculate_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.reset_button = ttk.Button(self.button_frame, command=self.reset, style="Plain.TButton")
+        self.reset_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        self.result_frame = ttk.LabelFrame(self.side_column, padding=(18, 16), style="Panel.TLabelframe")
+        self.result_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 14))
+        self.result_frame.columnconfigure(0, weight=1)
+        self.result_frame.rowconfigure(0, weight=1)
+
+        self.result_label = ttk.Label(self.result_frame, text="", wraplength=540, style="Result.TLabel")
+        self.result_label.grid(row=0, column=0, sticky="new")
+
+        self.recommendation_frame = ttk.LabelFrame(self.side_column, padding=(18, 16), style="Panel.TLabelframe")
+        self.recommendation_frame.grid(row=2, column=0, sticky="nsew")
+        self.recommendation_frame.columnconfigure(0, weight=1)
+        self.recommendation_frame.rowconfigure(0, weight=1)
+
+        self.recommendation_label = ttk.Label(
+            self.recommendation_frame,
+            text="",
+            wraplength=540,
+            style="Result.TLabel",
+        )
+        self.recommendation_label.grid(row=0, column=0, sticky="new")
+
+        self.video_frame = ttk.LabelFrame(self.visualizer_column, padding=(18, 16), style="Panel.TLabelframe")
+        self.video_frame.grid(row=0, column=0, sticky="nsew")
+
+        self.video_button_frame = ttk.Frame(self.video_frame, style="Panel.TFrame")
+        self.video_button_frame.pack(side="bottom", fill="x", pady=(12, 0))
+        for column in range(4):
+            self.video_button_frame.columnconfigure(column, weight=1)
+
+        self.video_play_button = ttk.Button(
+            self.video_button_frame,
+            command=self.play_current_video,
+            style="Accent.TButton",
+        )
+        self.video_play_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        self.video_pause_button = ttk.Button(
+            self.video_button_frame,
+            command=self.pause_current_video,
+            style="Plain.TButton",
+        )
+        self.video_pause_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+
+        self.video_restart_button = ttk.Button(
+            self.video_button_frame,
+            command=self.restart_current_video,
+            style="Plain.TButton",
+        )
+        self.video_restart_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+
+        self.video_open_button = ttk.Button(
+            self.video_button_frame,
+            command=self.open_current_video,
+            style="Secondary.TButton",
+        )
+        self.video_open_button.grid(row=0, column=3, sticky="ew")
+
+        self.video_size_frame = ttk.Frame(self.video_frame, style="Panel.TFrame")
+        self.video_size_frame.pack(side="bottom", fill="x", pady=(10, 0))
+        self.video_size_frame.columnconfigure(1, weight=1)
+
+        self.video_size_label = ttk.Label(self.video_size_frame, style="Field.TLabel")
+        self.video_size_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        self.video_width_slider = ttk.Scale(
+            self.video_size_frame,
+            from_=MIN_VIDEO_WIDTH,
+            to=MAX_VIDEO_WIDTH,
+            variable=self.video_width_var,
+            command=self.resize_video_display,
+        )
+        self.video_width_slider.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+        self.video_size_value = ttk.Label(self.video_size_frame, width=14, style="Field.TLabel")
+        self.video_size_value.grid(row=0, column=2, sticky="e", padx=(0, 10))
+
+        self.video_size_reset_button = ttk.Button(
+            self.video_size_frame,
+            command=self.reset_video_size,
+            style="Plain.TButton",
+        )
+        self.video_size_reset_button.grid(row=0, column=3, sticky="e")
+
+        self.video_status_label = ttk.Label(self.video_frame, text="", wraplength=540, style="Field.TLabel")
+        self.video_status_label.pack(side="bottom", fill="x", pady=(10, 0))
+
+        initial_video_width, initial_video_height = self.current_video_size()
+        self.video_panel = tk.Frame(
+            self.video_frame,
+            width=initial_video_width,
+            height=initial_video_height,
+            bg=VIDEO_SURFACE,
+            highlightbackground=ACCENT,
+            highlightthickness=1,
+        )
+        self.video_panel.pack(fill="both", expand=True, pady=(6, 0))
+        self.video_panel.pack_propagate(False)
+
+        self.video_label = tk.Label(
+            self.video_panel,
+            bg=VIDEO_SURFACE,
+            fg="#dbeafe",
+            font=self.app_font(10),
+            justify="center",
+            wraplength=400,
+        )
+        self.video_label.pack(fill="both", expand=True)
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    MarinePropellerAdvisorApp().run()
