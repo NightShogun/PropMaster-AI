@@ -1,3 +1,4 @@
+import re
 import shutil
 import subprocess
 import threading
@@ -5,12 +6,14 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
+from pathlib import Path
 from tkinter import ttk
 
 from constants import (
     ACCENT,
     ACCENT_DARK,
     APP_BG,
+    BLADE_WORDS,
     BORDER,
     DANGER,
     DEFAULT_VIDEO_WIDTH,
@@ -21,6 +24,7 @@ from constants import (
     SECONDARY,
     SECONDARY_DARK,
     SHIP_RPM_FACTORS,
+    SHIP_SEARCH_TERMS,
     SHIP_TYPES,
     SURFACE,
     SURFACE_SOFT,
@@ -32,12 +36,126 @@ from constants import (
 from i18n import translate
 from propeller import estimate_propeller, recommend_propeller, slip_note
 from ships import ship_display_name, ship_display_values, ship_type_from_display
-from video_search import build_video_queries, estimate_spec_text, fetch_archive_search_video, video_title
+from video_search import estimate_spec_text, fetch_archive_search_video, video_title
 
 try:
     from PIL import Image, ImageTk
 except ImportError as exc:
     raise SystemExit("Install Pillow first: pip install pillow") from exc
+
+
+LOCAL_PHOTO_DIR = Path(__file__).resolve().parent / "photos"
+LOCAL_VIDEO_DIR = Path(__file__).resolve().parent / "videos"
+LOCAL_PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".gif")
+LOCAL_VIDEO_EXTENSIONS = (".mp4", ".m4v", ".webm", ".ogv", ".mov")
+MEDIA_MODES = ("videos", "photos")
+RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+
+
+def normalized_media_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+def compact_media_text(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def blade_match_score(text, compact_text, blade_count):
+    word = BLADE_WORDS.get(blade_count, str(blade_count))
+    number = str(blade_count)
+    spaced_phrases = (
+        f"{number} blade",
+        f"{number} blades",
+        f"{number} bladed",
+        f"{word} blade",
+        f"{word} blades",
+        f"{word} bladed",
+    )
+    compact_phrases = (
+        f"{number}blade",
+        f"{number}blades",
+        f"{number}bladed",
+        f"{word}blade",
+        f"{word}blades",
+        f"{word}bladed",
+    )
+
+    if any(phrase in text for phrase in spaced_phrases) or any(phrase in compact_text for phrase in compact_phrases):
+        return 100
+
+    return 0
+
+
+def ship_match_score(text, compact_text, ship_type):
+    aliases = {
+        ship_type,
+        SHIP_SEARCH_TERMS.get(ship_type, ""),
+        ship_display_name(ship_type, "en"),
+    }
+    score = 0
+
+    for alias in aliases:
+        normalized_alias = normalized_media_text(alias)
+        compact_alias = compact_media_text(alias)
+        if normalized_alias and normalized_alias in text:
+            score += 60
+        elif compact_alias and compact_alias in compact_text:
+            score += 60
+
+    return score
+
+
+def recommendation_match_score(text, compact_text, recommendation):
+    score = 0
+    terms = (
+        recommendation.get("kind", ""),
+        recommendation.get("query", ""),
+        recommendation.get("en", ""),
+    )
+
+    for term in terms:
+        normalized_term = normalized_media_text(term)
+        compact_term = compact_media_text(term)
+        if normalized_term and normalized_term in text:
+            score += 30
+        elif compact_term and compact_term in compact_text:
+            score += 30
+
+    return score
+
+
+def score_local_media_file(path, root_dir, ship_type, estimate, recommendation):
+    relative_path = path.relative_to(root_dir).as_posix()
+    text = normalized_media_text(relative_path)
+    compact_text = compact_media_text(relative_path)
+    score = 0
+
+    score += blade_match_score(text, compact_text, estimate["blades"])
+    score += ship_match_score(text, compact_text, ship_type)
+    score += recommendation_match_score(text, compact_text, recommendation)
+
+    if "propeller" in text:
+        score += 25
+
+    return score
+
+
+def find_relevant_local_media(root_dir, extensions, ship_type, estimate, recommendation):
+    if not root_dir.exists():
+        return None, 0
+
+    candidates = sorted(path for path in root_dir.rglob("*") if path.is_file() and path.suffix.lower() in extensions)
+    if not candidates:
+        return None, 0
+
+    scored_candidates = [
+        (score_local_media_file(path, root_dir, ship_type, estimate, recommendation), path) for path in candidates
+    ]
+    best_score, best_path = max(scored_candidates, key=lambda item: item[0])
+    if best_score <= 0:
+        return candidates[0], 0
+
+    return best_path, best_score
 
 
 class MarinePropellerAdvisorApp:
@@ -52,6 +170,7 @@ class MarinePropellerAdvisorApp:
         self.video_playing = False
         self.video_paused = False
         self.video_frame_seen = False
+        self.last_media_context = None
 
         self.root = tk.Tk()
         self.root.geometry("1120x760")
@@ -63,6 +182,7 @@ class MarinePropellerAdvisorApp:
         self.latin_font = self.choose_font(["Segoe UI", "Noto Sans", "DejaVu Sans", "Arial"])
         self.arabic_font = self.choose_font(["Noto Sans Arabic", "Amiri", "DejaVu Sans", "Arial"])
         self.video_width_var = tk.DoubleVar(self.root, value=DEFAULT_VIDEO_WIDTH)
+        self.media_mode_var = tk.StringVar(self.root, value=MEDIA_MODES[0])
 
         self.style = ttk.Style(self.root)
         try:
@@ -98,6 +218,32 @@ class MarinePropellerAdvisorApp:
 
     def metric_line(self, en_label, ar_label, value):
         return f"{self.tr(en_label, ar_label)}: {value}"
+
+    def media_display_name(self, media_mode):
+        if media_mode == "photos":
+            return self.tr("Photos", "صور")
+
+        return self.tr("Videos", "فيديوهات")
+
+    def media_display_values(self):
+        return [self.media_display_name(media_mode) for media_mode in MEDIA_MODES]
+
+    def get_selected_media_mode(self):
+        selected_value = self.media_combo.get().strip() if hasattr(self, "media_combo") else ""
+        normalized_value = selected_value.lower()
+
+        for media_mode in MEDIA_MODES:
+            if normalized_value == media_mode or selected_value == self.media_display_name(media_mode):
+                return media_mode
+
+        return self.media_mode_var.get() if self.media_mode_var.get() in MEDIA_MODES else MEDIA_MODES[0]
+
+    def set_media_combo(self, media_mode):
+        if media_mode not in MEDIA_MODES:
+            media_mode = MEDIA_MODES[0]
+
+        self.media_mode_var.set(media_mode)
+        self.media_combo.set(self.media_display_name(media_mode))
 
     def read_positive_number(self, entry, en_name, ar_name):
         raw_value = entry.get().strip()
@@ -139,7 +285,8 @@ class MarinePropellerAdvisorApp:
         if not hasattr(self, "video_play_button"):
             return
 
-        has_video = self.current_video is not None
+        has_media = self.current_video is not None
+        has_video = has_media and self.current_video.get("type", "video") == "video"
         self.video_play_button.config(
             state=tk.NORMAL if has_video and (not self.video_playing or self.video_paused) else tk.DISABLED
         )
@@ -147,7 +294,7 @@ class MarinePropellerAdvisorApp:
             state=tk.NORMAL if has_video and self.video_playing and not self.video_paused else tk.DISABLED
         )
         self.video_restart_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
-        self.video_open_button.config(state=tk.NORMAL if has_video else tk.DISABLED)
+        self.video_open_button.config(state=tk.NORMAL if has_media else tk.DISABLED)
 
     def show_video_placeholder(self, message):
         self.sync_video_panel_size()
@@ -162,6 +309,31 @@ class MarinePropellerAdvisorApp:
         photo = ImageTk.PhotoImage(frame)
         self.video_label.config(image=photo, text="")
         self.video_label.image = photo
+
+    def display_photo_file(self, photo_path):
+        self.stop_video_playback(clear_frame=False)
+        self.sync_video_panel_size()
+        width, height = self.current_video_size()
+
+        try:
+            with Image.open(photo_path) as image:
+                display_image = image.convert("RGB")
+        except OSError as exc:
+            self.show_video_placeholder(self.tr("Could not load this photo.", "تعذر تحميل هذه الصورة."))
+            self.set_video_status(str(exc))
+            self.set_video_buttons_state()
+            return
+
+        display_image.thumbnail((width, height), RESAMPLE)
+        canvas = Image.new("RGB", (width, height), VIDEO_SURFACE)
+        x = (width - display_image.width) // 2
+        y = (height - display_image.height) // 2
+        canvas.paste(display_image, (x, y))
+
+        photo = ImageTk.PhotoImage(canvas)
+        self.video_label.config(image=photo, text="")
+        self.video_label.image = photo
+        self.set_video_buttons_state()
 
     @staticmethod
     def read_video_frame(stdout, frame_size):
@@ -183,36 +355,51 @@ class MarinePropellerAdvisorApp:
         if not ffmpeg_path:
             return None
 
+        video_source = str(video_url)
+        is_remote_source = "://" in video_source
         scale_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,"
             f"fps={VIDEO_FPS}"
         )
-        return [
+
+        command = [
             ffmpeg_path,
             "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
-            "-user_agent",
-            HTTP_HEADERS["User-Agent"],
-            "-reconnect",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "4",
-            "-i",
-            video_url,
-            "-an",
-            "-vf",
-            scale_filter,
-            "-pix_fmt",
-            "rgb24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
         ]
+
+        if is_remote_source:
+            command.extend(
+                [
+                    "-user_agent",
+                    HTTP_HEADERS["User-Agent"],
+                    "-reconnect",
+                    "1",
+                    "-reconnect_streamed",
+                    "1",
+                    "-reconnect_delay_max",
+                    "4",
+                ]
+            )
+
+        command.extend(
+            [
+                "-i",
+                video_source,
+                "-an",
+                "-vf",
+                scale_filter,
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
+        )
+        return command
 
     def video_reader(self, session_id, process, width, height):
         frame_size = width * height * 3
@@ -276,7 +463,7 @@ class MarinePropellerAdvisorApp:
         self.terminate_video_process(process)
 
         if clear_frame and hasattr(self, "video_label"):
-            self.show_video_placeholder(self.tr("Video preview", "معاينة الفيديو"))
+            self.show_video_placeholder(self.tr("Media preview", "معاينة الوسائط"))
 
         self.set_video_buttons_state()
 
@@ -290,8 +477,8 @@ class MarinePropellerAdvisorApp:
         if command is None:
             self.show_video_placeholder(
                 self.tr(
-                    "Video found, but ffmpeg is required for in-app playback. Use Open Video.",
-                    "تم العثور على فيديو، لكن ffmpeg مطلوب للتشغيل داخل التطبيق. استخدم فتح الفيديو.",
+                    "Video found, but ffmpeg is required for in-app playback. Use Open Media.",
+                    "تم العثور على فيديو، لكن ffmpeg مطلوب للتشغيل داخل التطبيق. استخدم فتح الوسائط.",
                 )
             )
             self.set_video_status(
@@ -335,11 +522,11 @@ class MarinePropellerAdvisorApp:
         if not self.video_frame_seen:
             self.show_video_placeholder(
                 self.tr(
-                    "Video found, but playback could not start. Use Open Video.",
-                    "تم العثور على فيديو، لكن تعذر تشغيله. استخدم فتح الفيديو.",
+                    "Video found, but playback could not start. Use Open Media.",
+                    "تم العثور على فيديو، لكن تعذر تشغيله. استخدم فتح الوسائط.",
                 )
             )
-            self.set_video_status(self.tr("Playback failed for this online video.", "فشل تشغيل هذا الفيديو من الإنترنت."))
+            self.set_video_status(self.tr("Playback failed for this video.", "فشل تشغيل هذا الفيديو."))
         else:
             self.set_video_status(
                 self.tr("Video ended. Use Restart to replay.", "انتهى الفيديو. استخدم إعادة التشغيل للمشاهدة مرة أخرى.")
@@ -349,6 +536,8 @@ class MarinePropellerAdvisorApp:
 
     def play_current_video(self):
         if self.current_video is None:
+            return
+        if self.current_video.get("type", "video") != "video":
             return
 
         if self.video_playing and self.video_paused:
@@ -369,7 +558,7 @@ class MarinePropellerAdvisorApp:
         self.set_video_buttons_state()
 
     def restart_current_video(self):
-        if self.current_video is not None:
+        if self.current_video is not None and self.current_video.get("type", "video") == "video":
             self.start_video_playback(self.current_video)
 
     def open_current_video(self):
@@ -380,6 +569,8 @@ class MarinePropellerAdvisorApp:
 
     def resize_video_display(self, value=None):
         self.sync_video_panel_size()
+        if self.current_video is not None and self.current_video.get("type") == "photo":
+            self.display_photo_file(Path(self.current_video["url"]))
 
     def finish_video_load(self, request_id, video_result):
         if request_id != self.video_request_id:
@@ -454,10 +645,11 @@ class MarinePropellerAdvisorApp:
     def clear_outputs(self):
         self.video_request_id += 1
         self.current_video = None
+        self.last_media_context = None
         self.stop_video_playback(clear_frame=False)
         self.result_label.config(text="", style="Result.TLabel")
         self.recommendation_label.config(text="")
-        self.show_video_placeholder(self.tr("Video preview", "معاينة الفيديو"))
+        self.show_video_placeholder(self.tr("Media preview", "معاينة الوسائط"))
         self.set_video_status("")
         self.set_video_buttons_state()
 
@@ -466,6 +658,82 @@ class MarinePropellerAdvisorApp:
         self.entry_speed.delete(0, tk.END)
         self.set_ship_combo(SHIP_TYPES[0])
         self.clear_outputs()
+
+    def show_selected_local_media(self):
+        if self.last_media_context is None:
+            return
+
+        self.video_request_id += 1
+        media_mode = self.get_selected_media_mode()
+        ship_type = self.last_media_context["ship_type"]
+        estimate = self.last_media_context["estimate"]
+        recommendation = self.last_media_context["recommendation"]
+
+        if media_mode == "photos":
+            photo_path, score = find_relevant_local_media(
+                LOCAL_PHOTO_DIR,
+                LOCAL_PHOTO_EXTENSIONS,
+                ship_type,
+                estimate,
+                recommendation,
+            )
+            if photo_path is None:
+                self.current_video = None
+                self.stop_video_playback(clear_frame=False)
+                self.show_video_placeholder(
+                    self.tr(
+                        "No photo file found in the photos folder.",
+                        "لم يتم العثور على ملف صورة في مجلد photos.",
+                    )
+                )
+                self.set_video_status("")
+                self.set_video_buttons_state()
+                return
+
+            self.current_video = {
+                "type": "photo",
+                "title": photo_path.name,
+                "url": str(photo_path),
+                "page_url": photo_path.as_uri(),
+            }
+            status = "Matched local photo" if score > 0 else "Showing local photo"
+            status_ar = "صورة محلية مطابقة" if score > 0 else "عرض صورة محلية"
+            self.display_photo_file(photo_path)
+            self.set_video_status(self.tr(f"{status}: {photo_path.name}", f"{status_ar}: {photo_path.name}"))
+            self.set_video_buttons_state()
+            return
+
+        video_path, score = find_relevant_local_media(
+            LOCAL_VIDEO_DIR,
+            LOCAL_VIDEO_EXTENSIONS,
+            ship_type,
+            estimate,
+            recommendation,
+        )
+        if video_path is None:
+            self.current_video = None
+            self.stop_video_playback(clear_frame=False)
+            self.show_video_placeholder(
+                self.tr(
+                    "No video file found in the videos folder.",
+                    "لم يتم العثور على ملف فيديو في مجلد videos.",
+                )
+            )
+            self.set_video_status("")
+            self.set_video_buttons_state()
+            return
+
+        self.current_video = {
+            "type": "video",
+            "title": video_path.name,
+            "url": str(video_path),
+            "page_url": video_path.as_uri(),
+        }
+        status = "Matched local video" if score > 0 else "Showing local video"
+        status_ar = "فيديو محلي مطابق" if score > 0 else "عرض فيديو محلي"
+        self.set_video_status(self.tr(f"{status}: {video_path.name}", f"{status_ar}: {video_path.name}"))
+        self.set_video_buttons_state()
+        self.start_video_playback(self.current_video)
 
     def calculate(self):
         try:
@@ -483,7 +751,6 @@ class MarinePropellerAdvisorApp:
             return
 
         recommendation = recommend_propeller(ship_type, speed_knots, estimate["slip"])
-        search_groups = build_video_queries(ship_type, speed_knots, estimate, recommendation)
         efficiency_percent = estimate["efficiency"] * 100
         note = slip_note(estimate["slip"], self.lang)
 
@@ -506,7 +773,16 @@ class MarinePropellerAdvisorApp:
             recommendation["en"] if self.lang == "en" else recommendation["ar"],
         ]
         self.recommendation_label.config(text="\n".join(recommendation_lines))
-        self.load_video(search_groups, ship_type, speed_knots, estimate, recommendation)
+        self.last_media_context = {
+            "ship_type": ship_type,
+            "estimate": estimate,
+            "recommendation": recommendation,
+        }
+        self.show_selected_local_media()
+
+    def change_media_mode(self, event=None):
+        self.media_mode_var.set(self.get_selected_media_mode())
+        self.show_selected_local_media()
 
     def change_lang(self, event=None):
         self.lang = self.lang_combo.get()
@@ -615,6 +891,7 @@ class MarinePropellerAdvisorApp:
             self.power_label,
             self.speed_label,
             self.ship_label,
+            self.media_label,
             self.result_label,
             self.recommendation_label,
             self.video_size_label,
@@ -631,6 +908,7 @@ class MarinePropellerAdvisorApp:
 
     def refresh_language(self):
         selected_ship_type = self.get_selected_ship_type() or SHIP_TYPES[0]
+        selected_media_mode = self.get_selected_media_mode()
 
         self.configure_styles()
         self.apply_language_layout()
@@ -642,6 +920,7 @@ class MarinePropellerAdvisorApp:
         self.power_label.config(text=self.tr("Power (kW)", "القدرة (kW)"))
         self.speed_label.config(text=self.tr("Speed (knots)", "السرعة (عقدة)"))
         self.ship_label.config(text=self.tr("Ship Type", "نوع السفينة"))
+        self.media_label.config(text=self.tr("Media Type", "نوع الوسائط"))
         self.entry_power.config(font=self.app_font(11))
         self.entry_speed.config(font=self.app_font(11))
         self.calculate_button.config(text=self.tr("Calculate", "احسب"))
@@ -649,19 +928,21 @@ class MarinePropellerAdvisorApp:
         self.result_frame.config(text=self.tr("Estimate", "التقدير"))
         self.recommendation_frame.config(text=self.tr("Recommendation", "التوصية"))
         self.video_frame.config(text=self.tr("Visualizer", "العارض"))
-        self.video_size_label.config(text=self.tr("Video width", "عرض الفيديو"))
+        self.video_size_label.config(text=self.tr("Media width", "عرض الوسائط"))
         self.video_play_button.config(text=self.tr("Play", "تشغيل"))
         self.video_pause_button.config(text=self.tr("Pause", "إيقاف مؤقت"))
         self.video_restart_button.config(text=self.tr("Restart", "إعادة تشغيل"))
-        self.video_open_button.config(text=self.tr("Open Video", "فتح الفيديو"))
+        self.video_open_button.config(text=self.tr("Open Media", "فتح الوسائط"))
         self.video_size_reset_button.config(text=self.tr("Reset size", "إعادة الحجم"))
         self.lang_combo.config(font=self.app_font(10))
         self.ship_combo.config(values=ship_display_values(self.lang), font=self.app_font(10))
         self.set_ship_combo(selected_ship_type)
+        self.media_combo.config(values=self.media_display_values(), font=self.app_font(10))
+        self.set_media_combo(selected_media_mode)
         self.set_video_buttons_state()
 
         if not self.result_label.cget("text") and not self.recommendation_label.cget("text"):
-            self.show_video_placeholder(self.tr("Video preview", "معاينة الفيديو"))
+            self.show_video_placeholder(self.tr("Media preview", "معاينة الوسائط"))
 
     def update_scroll_region(self, event=None):
         self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
@@ -780,8 +1061,15 @@ class MarinePropellerAdvisorApp:
         self.ship_combo.grid(row=2, column=1, sticky="ew", pady=6)
         self.set_ship_combo(SHIP_TYPES[0])
 
+        self.media_label = ttk.Label(self.input_frame, style="Field.TLabel")
+        self.media_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.media_combo = ttk.Combobox(self.input_frame, values=self.media_display_values(), state="readonly")
+        self.media_combo.grid(row=3, column=1, sticky="ew", pady=6)
+        self.set_media_combo(MEDIA_MODES[0])
+        self.media_combo.bind("<<ComboboxSelected>>", self.change_media_mode)
+
         self.button_frame = ttk.Frame(self.input_frame, style="Panel.TFrame")
-        self.button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        self.button_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         self.button_frame.columnconfigure(0, weight=1)
         self.button_frame.columnconfigure(1, weight=1)
 
